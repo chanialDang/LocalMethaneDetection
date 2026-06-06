@@ -1,0 +1,11 @@
+numpy
+matplotlib
+rich
+
+# Testing (run: pytest tests/ -v)
+pytest
+
+# Optional — only needed for AI-written graph explanations (explain.py).
+# Without it (or without an OPENAI_API_KEY), the code falls back to a
+# template explanation automatically, so this is safe to skip.
+openai
