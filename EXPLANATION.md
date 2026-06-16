@@ -1,3 +1,4 @@
+
 # What This Code Does — Plain-English Explanation
 
 ## The big picture
@@ -209,3 +210,30 @@ The feasibility sweep in `demo.py` is already Week 4's core output. If it
 shows Q=0.01 g/s is undetectable at 100 m under neutral conditions, that
 tells you exactly what emission rate or sensor placement you need before
 collecting a single data point.
+
+## Collecting real data (the Field Tests page)
+
+The forward model *predicts* readings; the **Field Tests** page (`/fieldtests.html`)
+takes in *real* ones. The important thing to understand: the model draws a
+**map** (concentration everywhere at once), but a real sensor only gives you a
+**graph over time** at one spot — methane shows up as a bump rising out of the
+1.9 ppm background as the wind carries the plume past. So real data gets its own
+**ppm-vs-time graph, one per field test**, and the map stays the model/reference.
+
+What happens when you upload a CSV (columns: at least `ppm`; optionally `time`,
+`temperature`, `humidity`):
+
+1. The same cleaning pipeline from `processing.py` runs — remove weather drift,
+   subtract the slow baseline, smooth, then decide whether a real event is there
+   (the excess must stay above 3× the noise floor for several samples).
+2. You get a graph (raw + baseline + cleaned excess + threshold + the detected
+   window), metric cards, and a plain-English **interpretation** (the same
+   AI-or-template path as the model caption — it never breaks without a key).
+3. The raw readings are **stored** (Railway Postgres if configured, otherwise a
+   local file), so you can reopen tests later and **compare runs** to see how
+   repeatable they are — directly exposing variance/deviation across field tests.
+
+No sensor yet? Hit **Generate sample test** (or download the sample CSV) to walk
+the whole flow with realistic synthetic data first. See `CLAUDE.md` →
+"Field-test data collection" for the API and the one-line Railway `DATABASE_URL`
+setup.

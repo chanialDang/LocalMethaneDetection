@@ -14,26 +14,154 @@ The sensor is a **Figaro TGS 2611-E00 MOX sensor**, characterised by the
 manufacturer at 500–12,500 ppm. Using it at 2–40 ppm above a 1.9 ppm background
 is the research contribution.
 
+**Deployment / data sequence (keep in mind for the inversion):** real inversion
+data arrives in two stages — **(1) Custer Road Transfer Station (Allen, TX) first**,
+then **(2) a Melissa, TX landfill second** as the follow-on test site. The Week-3
+inversion + the whole pipeline must run unchanged on both. Melissa is expected to be
+the harder, lower-ppm case, so the optimizer and detection floor have to hold up at
+**very small ppm above the 1.9 ppm background** — design every guard rail for that
+worst case, not just the stronger Custer signal.
+
+---
+
+## Current status (Week 2 — validated green)
+
+- `python3 -m pytest tests/ -v` → **102/102 PASS**. `python3 -m misc.demo` now runs validation,
+  saves `plume_contour.png`, then **serves the interactive web dashboard** at
+  `http://127.0.0.1:5050` and opens the browser (Ctrl+C to stop). For a non-blocking,
+  exit-0 run (tests/CI) use **`MPLBACKEND=Agg python3 -m misc.demo --check`** — it validates +
+  writes the PNG and exits without serving. (Entry points run as modules from the project
+  root — `python3 -m misc.demo` / `-m misc.server` / `-m misc.ask` — so the `physics`/`ui`/
+  `misc` packages import cleanly.) Use `python3` (the numpy/matplotlib interpreter
+  here is `/usr/bin/python3`, 3.9.6). The old blocking `plt.show()` is gone — matplotlib runs
+  headless (Agg) for the PNG and the live, interactive graph is the browser dashboard.
+  (Port 5050, not 5000: macOS AirPlay Receiver squats on 5000.)
+- **σ table** — Briggs (1973) open-country formulas, 6 classes A–F, tabulated
+  1–200 m by `generate_sigma_table.py`. The committed `briggs_dispersion_sigma.csv`
+  is byte-identical to the generator output (verified reproducible provenance).
+- **Ground reflection — consistent (not an open issue).** `concentration_gm3` uses a
+  2π denominator with the real+image vertical term (which equals 2 at the ground), so
+  it reduces to the standard `C = Q/(π σ_y σ_z u)` at H=z=0 — the correct
+  ground-level-with-reflection form.
+- **Feasibility (Briggs Class-D σ):** smallest detectable leak at the 50 m fence
+  ≈ **0.05 g/s** (threshold 0.90 ppm = 3× the 0.30 ppm noise floor) — but that is a
+  *lab-floor* figure. `verdict()` now reframes it as an **upper bound** carrying a
+  wind/stability error bar (`implied_Q_range`: the same fenceline signal implies Q over a
+  ~160× range across plausible wind 0.5–5 m/s and classes B–F), and can report a
+  field-realistic floor (random noise averages as √N; calibration bias does not).
+- **Field-test data collection (NEW).** Real CSV readings can be uploaded, cleaned (the
+  `processing.py` pipeline), detection-checked, interpreted (AI or template), stored, and
+  compared across runs — **one ppm-vs-time graph per field test**. Storage is `db.py`:
+  Railway Postgres when `DATABASE_URL` is set, else a local SQLite file (offline/tests).
+  Three pages now: `/` (Model contour), `/fieldtests.html` (data collection),
+  `/explain.html` (how it works). See "Field-test data collection" below.
+
+**Before trusting any "detectable?" verdict** — the noise floor (0.30 ppm) and the
+temperature/humidity coefficients are **ASSUMED placeholders**; measure them on the real
+Figaro first (see the Constants table). Replacing the linear weather correction with a
+nonlinear form (adding a T·H interaction term) is a candidate future improvement.
+
+---
+
+## Automated improvement log (self-paced /loop)
+
+A recursive-improvement loop made these **verified** changes — full test suite green
+(now 35 tests) and `demo.py` exit 0 after each step; physics behaviour preserved unless
+noted.
+
+1. **Vectorized `predict_ppm`** — replaced the per-receptor Python loop and the per-call
+   σ-table re-sort with cached numpy arrays + `np.interp`; factored the Gaussian profile
+   into one shared `_plume_shape`. 50k-point grid **2822 ms → ~2 ms (~1280×)**, output
+   numerically identical (max Δ 1.7e-13). This is the hot path Week-3 inversion will hammer.
+2. **σ-table provenance verified** — `generate_sigma_table.py` output is byte-identical to
+   the committed CSV; the six Briggs formulas + anchors hand-checked; an unverified
+   "Table 4-4" citation softened.
+3. **Context trimmed** — the dated "Next session" / blocker-history block became the
+   compact status above; the π-vs-2π "open item" resolved in-doc (the code's form is the
+   standard correct one).
+4. **Test coverage 5 → 35** — `test_plume.py` (physics core + a vectorized-vs-scalar
+   equivalence guard), `test_feasibility.py` (pins the 0.05 g/s fenceline verdict),
+   `test_explain.py` (template + clean AI-absent fallback).
+5. **Security** — added `.gitignore`; `.env` (OPENAI_API_KEY) is no longer one `git add .`
+   from being committed.
+6. **Web dashboard (replaces blocking `plt.show()`).** Added `server.py` (localhost Flask) +
+   `ui/web/` (plain HTML/CSS/JS + vendored Plotly) so `python3 -m misc.demo` now opens an interactive
+   browser graph with an "Explain this graph" caption and a chat widget; the OpenAI key stays
+   server-side. The duplicated 250×200 grid construction (demo.py + scenario_facts) was
+   factored into one `explain.compute_field()` reused everywhere (numerically identical;
+   `test_server.py` pins it). `demo.py --check` keeps the non-blocking exit-0 path.
+
+**Boundary decision — RESOLVED (optimizer-safe mode).** `predict_ppm` now takes
+`clamp_to_table: bool = False`. Default (strict) still raises for any downwind
+distance outside the σ table's 1–200 m band, so demo/validation runs surface bad
+geometry. The Week-3 inversion calls `predict_ppm(..., clamp_to_table=True)`, which
+**never raises on geometry**: sub-1 m downwind points clamp up to the 1 m floor, and
+>200 m points fall back to background only (a source that far is effectively
+undetectable here). This is the guard rail that keeps `scipy.optimize` alive while it
+probes source positions on top of / far from a sensor. Locked by 6 tests in
+`test_plume.py`. The optimizer still owns three bounds the forward model does NOT
+auto-fix: `u ≥ 0.5 m/s`, integer `stability_class` (fix or loop, never vary
+continuously), and `Q ≥ 0`. See `predict_ppm`'s docstring and memory
+`plume-predict-ppm-boundary`.
+
 ---
 
 ## File layout
 
+The code is grouped into three packages — **`physics/`** (the numerical core,
+the "math"), **`ui/`** (explanation + browser dashboard), and **`misc/`**
+(runnable entry points + storage plumbing) — plus `tests/` and root config.
+Each package is a real Python package (`__init__.py`), so imports are absolute:
+`from physics.plume import …`, `from ui.explain import …`, `from misc import db`.
+
 ```
 LocalMethaneDetection/
-├── plume.py                   # Core physics module — Gaussian plume + Briggs σ
-├── sensor_sim.py              # Synthetic sensor data: truth + noise + weather
-├── processing.py              # Signal cleaning: baseline, averaging, T-H, detection
-├── feasibility.py             # Forward-model sweep + detectability verdict
-├── explain.py                 # Caption generation: template or OpenAI-enriched
-├── demo.py                    # Validation, sweep, contour plot with caption
-├── tests/test_processing.py   # Pytest suite (Tests 1–5)
-├── conftest.py                # Pytest configuration (makes project importable)
-├── otm33a_dispersion_sigma.csv # Briggs σ lookup table (1–200 m, 6 classes)
-├── plume_contour.png          # Output from demo.py (with caption box)
-├── requirements.txt           # numpy, matplotlib, rich, pytest, openai (opt)
-├── CLAUDE.md                  # This file (architecture & API docs)
-└── EXPLANATION.md             # Plain-English project overview
+├── physics/                       # ── "math": numerical core ──────────────────
+│   ├── plume.py                   #   Core physics — Gaussian plume + Briggs σ
+│   ├── sensor_sim.py              #   Synthetic sensor data: truth + noise + weather
+│   ├── processing.py              #   Signal cleaning: baseline, averaging, T-H, detection
+│   ├── feasibility.py             #   Forward-model sweep + detectability verdict
+│   ├── fieldtest.py               #   REAL readings: CSV parse + cleaning pipeline + sample gen
+│   ├── generate_sigma_table.py    #   Regenerates the σ table from Briggs (1973) formulas
+│   └── briggs_dispersion_sigma.csv#   Briggs σ lookup table (1–200 m, 6 classes A–F)
+├── ui/                            # ── explanation + dashboard front-end ────────
+│   ├── explain.py                 #   Caption + Q&A + field-test interpret; compute_field
+│   └── web/                       #   Browser dashboard (no build step)
+│       ├── index.html             #     Model: contour + explain/chat (+ shared nav)
+│       ├── fieldtests.html        #     Field Tests: upload, per-test time series, interpret, compare
+│       ├── explain.html           #     How it works: plain-English guide + chat
+│       ├── common.js              #     shared helpers + reusable chat widget (window.CH4)
+│       ├── app.js                 #     Model page: contour + explain/chat
+│       ├── fieldtests.js          #     Field Tests page: upload/list/detail/compare logic
+│       ├── styles.css             #     dark instrument-readout theme (Fira Code/Sans)
+│       └── vendor/plotly.min.js   #     Plotly cartesian bundle, vendored for offline use
+├── misc/                          # ── runnable entry points + storage plumbing ─
+│   ├── demo.py                    #   Validation + sweep + PNG, then launches the web dashboard
+│   ├── server.py                  #   Flask backend (localhost): model API + /api/fieldtests/* + OpenAI proxy
+│   ├── ask.py                     #   Single-shot CLI Q&A about the model/graph
+│   └── db.py                      #   Field-test storage: Railway Postgres (DATABASE_URL) | local SQLite
+├── tests/test_processing.py       # Pytest — signal processing (Tests 1–5)
+├── tests/test_plume.py            # Pytest — physics core + vectorization equivalence
+├── tests/test_feasibility.py      # Pytest — feasibility sweep + verdict
+├── tests/test_explain.py          # Pytest — caption template + AI-absent fallback
+├── tests/test_server.py           # Pytest — compute_field equivalence + model JSON API
+├── tests/test_db.py               # Pytest — storage layer (SQLite roundtrip, cascade delete)
+├── tests/test_fieldtest.py        # Pytest — CSV parse + cleaning pipeline + interpret
+├── tests/test_server_fieldtests.py# Pytest — field-test API (upload/detail/compare/degrade)
+├── conftest.py                    # Pytest config — puts the project root on sys.path
+├── samples/custer_sample.csv      # Example readings CSV (from sensor_sim) — try the upload flow
+├── plume_contour.png              # Static figure from demo.py (with caption box)
+├── Procfile                       # OPTIONAL — deploy the whole app to Railway (gunicorn misc.server:app)
+├── requirements.txt               # numpy, matplotlib, rich, flask, pytest; openai/psycopg/gunicorn (opt)
+├── CLAUDE.md                      # This file (architecture & API docs)
+└── EXPLANATION.md                 # Plain-English project overview
 ```
+
+**Path notes (so moves don't break):** `physics/plume.py` and
+`physics/generate_sigma_table.py` resolve `briggs_dispersion_sigma.csv` next to
+themselves (inside `physics/`); `ui/explain.py` and `misc/db.py` read `.env` from
+the **project root** (one level up); `misc/server.py` resolves the dashboard at
+`ui/web/` absolutely, so it serves correctly from any working directory.
 
 ---
 
@@ -80,7 +208,8 @@ y_wind = dx·(cos φ)  + dy·(−sin φ)    # crosswind
 | `M_CH4` | 16.04 | g/mol | IUPAC 2021 | `plume.py` |
 | `CH4_BACKGROUND` | 1.9 | ppm | NOAA GML 2023 | `plume.py`, `sensor_sim.py` |
 | `U_MIN` | 0.5 | m/s | Model undefined below this | `plume.py` |
-| `SENSOR_NOISE_PPM` | 0.30 | ppm (1σ) | **ASSUMED** — replace with measured value | `sensor_sim.py` |
+| `SENSOR_NOISE_PPM` | 0.30 | ppm (1σ) | **ASSUMED** — RANDOM jitter; averages down as √N | `sensor_sim.py` |
+| `BIAS_FLOOR_PPM` | 0.00 | ppm (1σ) | **ASSUMED** — non-averageable bias/drift; `effective_noise_floor` combines it with the random part in quadrature | `sensor_sim.py` |
 | `DETECT_K` | 3.0 | sigmas | Detection threshold (k·noise_std) | `sensor_sim.py` (imported by `feasibility.py`, `explain.py`) |
 | `BASELINE_DRIFT_PPM` | 1.00 | ppm | **ASSUMED** — slow sensor zero wander | `sensor_sim.py` |
 | `TEMP_COEFF_PPM_PER_C` | 0.05 | ppm/°C | **ASSUMED** — MOX sensitivity to temperature | `sensor_sim.py` |
@@ -193,9 +322,16 @@ the leak we care about?"**
 - `sweep(Q_list, distance_list, stability_list, ...)` → computes `predict_ppm`
   for every (Q, distance, stability) combination; classifies each as
   "detectable" (excess ≥ 3σ noise), "marginal", or "undetectable".
-- `verdict(cells, fence_distance=50.0, stability=4, noise_floor=0.30, k=3.0)` 
-  → returns a plain-English sentence: the minimum detectable leak at the fenceline,
-  or whether detection is infeasible.
+- `implied_Q_range(observed_excess_ppm, distance, u_list, stability_list, ...)` → back-solves
+  the source strength Q for a fixed observed signal across a wind × stability grid (exploiting
+  the plume's linearity in Q — one forward eval per cell, no optimizer). Returns min/median/max
+  Q plus a `swing_factor` (the multiplier by which Q is uncertain when wind/stability are not
+  known). This is the **quantified error bar** behind the upper-bound verdict.
+- `verdict(cells, fence_distance=50.0, stability=4, noise_floor=0.30, k=3.0, bias_floor=0.0, n_avg=1)`
+  → plain-English bottom line. Keeps the headline minimum detectable leak, then reframes it as an
+  **upper bound** via `implied_Q_range`; if `bias_floor`/`n_avg` are supplied it also reports the
+  field-realistic floor (`sensor_sim.effective_noise_floor`: random noise ÷√n_avg ⊕ non-averageable
+  bias). Defaults reproduce the original single-line verdict.
 
 **Classification threshold:** A signal is **detectable** if it exceeds
 `k × SENSOR_NOISE_PPM` (default: 3 × 0.30 = 0.90 ppm). This is the same
@@ -229,6 +365,81 @@ caption, source = explain_field(ppm_grid, xs, ys, params, noise_floor, use_ai=Tr
 # source is "openai" or "template"
 ```
 
+### Ask the AI a question (`ask.py`)
+
+Single-shot CLI — the way to ask questions about the model/graph:
+```bash
+python3 -m misc.ask "what does the green dashed line on the graph mean?"
+python3 -m misc.ask "why does the inversion need clamp_to_table?"
+```
+It takes the question as an argument (no stdin), so it works in any context with
+internet — there is **no interactive chat loop** (the old `chat_session()` was removed
+because it needs a real controlling terminal, which many launch contexts don't provide).
+`ask_once(question, facts)` in `explain.py` does one OpenAI call grounded in
+`_CHAT_SYSTEM_PROMPT` (full project knowledge) plus the current graph's numbers from
+`scenario_facts()` (built from the shared `DEFAULT_SCENARIO`). On failure it returns a
+**plain-English error** (no key / no internet / bad key) rather than failing silently.
+
+**Requires a VALID `OPENAI_API_KEY` in `.env`.** A malformed-but-present key returns
+OpenAI 401 "Incorrect API key"; the demo's caption-source line and `ask.py` both surface
+that reason (via `explain.LAST_AI_ERROR`) instead of telling you to set a key you already
+set. The plot caption falls back to the template and never breaks regardless.
+
+---
+
+## Field-test data collection (real readings)
+
+The forward model PREDICTS readings; this is where REAL ones come in. A **field test** is one
+deployment of the Figaro sensor — a ppm-vs-time CSV at a single location. Each test gets its own
+time-series graph (raw + estimated baseline + cleaned excess + 3σ threshold + detected-event
+window), an AI/template interpretation, and a chat grounded in its numbers. Multiple tests can be
+overlaid to see run-to-run variance.
+
+**Key idea — two shapes of data:** the model is a *field over space* (the contour); a real sensor
+is a *series over time* at one point. So real data lives on the per-test time-series graph, not
+the contour — the contour stays the model/reference. (Week-3 inversion will later estimate the
+source from real data and put it back on the map.)
+
+**Pieces (all reuse existing, tested code):**
+- `fieldtest.parse_csv(data)` — flexible CSV reader (needs a methane column; time/temperature/
+  humidity optional). `fieldtest.process_fieldtest(...)` runs the SAME `processing.py` pipeline
+  (temp/humidity correct → baseline subtract → smooth → detect) and returns plottable arrays in
+  the raw frame (`raw ≈ baseline + excess`). `fieldtest.make_sample_readings(...)` builds a
+  synthetic test via `sensor_sim` so the flow works before the real sensor exists.
+- `explain.summarize_fieldtest / template_fieldtest_explanation / interpret_fieldtest` mirror the
+  model-side trio (template always available; OpenAI when a key works; `LAST_AI_ERROR` surfaced).
+  Chat reuses `explain.ask_once(question, facts)` unchanged.
+- `db.py` stores **only the raw readings** (`field_tests` ──< `readings`); the processed view is
+  recomputed on read, so cleaning/noise-floor can be retuned without re-uploading.
+
+**Storage backend (`db.py`):**
+- `DATABASE_URL` set (Postgres) → **Railway Postgres** via `psycopg` (lazy import).
+- `DATABASE_URL` unset → **local SQLite** file `fieldtests.db` (stdlib; offline + tests).
+- `db.backend_label()` reports which is active; `db.init_schema()` is idempotent (the API calls
+  it lazily, re-initialising automatically if the backend changes — that is how the tests isolate
+  a temp DB per case).
+
+**API (added to `server.py`; same-origin, OpenAI key stays server-side):**
+- `GET    /api/fieldtests` → list + per-test summary + `backend`.
+- `POST   /api/fieldtests` (multipart CSV + metadata) → store raw → `{id, meta, facts, series}`.
+- `GET    /api/fieldtests/<id>` → meta + full series + facts.
+- `POST   /api/fieldtests/<id>/interpret` `{use_ai}` → `{text, source, ai_error}`.
+- `POST   /api/fieldtests/<id>/ask` `{question}` → `{answer}` (grounded in the test).
+- `GET    /api/fieldtests/compare?ids=…` → overlay series + across-test spread (variance).
+- `DELETE /api/fieldtests/<id>`, `POST /api/fieldtests/sample`, `GET /api/sample.csv`.
+
+**Railway setup (local app + remote DB — the chosen mode):**
+1. Create a Railway project and add a **Postgres** database (dashboard, or `railway add`).
+2. Copy its **public** connection string (Railway → Postgres → *Connect* → Public Network, i.e.
+   `DATABASE_PUBLIC_URL`) into the local `.env` as one line (it is a secret; `.env` is gitignored):
+   `DATABASE_URL=postgresql://user:pass@host.proxy.rlwy.net:PORT/railway`
+3. `pip install -r requirements.txt` (pulls `psycopg[binary]`), then `python3 -m misc.server`. The
+   schema is created automatically on first request. The app still binds **127.0.0.1 only** —
+   nothing is exposed; only the DB connection leaves your machine (over TLS).
+4. With `DATABASE_URL` unset it transparently uses local `fieldtests.db` instead — no Railway
+   needed to develop. (Deploying the *whole* app to Railway later is the optional `Procfile`/
+   `gunicorn` path; that makes the endpoints public, so add auth first.)
+
 ---
 
 ## Running the demo and tests
@@ -238,30 +449,61 @@ caption, source = explain_field(ppm_grid, xs, ys, params, noise_floor, use_ai=Tr
 pip install -r requirements.txt
 ```
 
-**Run the forward model validation and feasibility assessment:**
+**Run the forward model + open the interactive dashboard:**
 ```bash
-python demo.py
+python3 -m misc.demo        # run as a module from the project root
 ```
-- Validation: Gaussian plume equation, unit conversion, wind rotation checks.
-- Feasibility sweep: 24 cases (4 leak sizes, 3 distances, 2 stability classes).
-- Contour plot: `plume_contour.png` with detection-limit line and plain-English caption.
-- Exit code 1 if any validation fails.
+- Validation (Gaussian plume, unit conversion, wind rotation), feasibility sweep (24 cases),
+  and `plume_contour.png` (static figure with caption).
+- Then it serves the **web dashboard** at `http://127.0.0.1:5050` and opens your browser:
+  an interactive Plotly contour, metric cards, centreline decay, the feasibility verdict, an
+  "Explain this graph" caption, and a chat widget. Ctrl+C to stop. Exit code 1 if validation fails.
 
-**Run the processing tests:**
+**Validation only (non-blocking — tests/CI):**
 ```bash
-pytest tests/ -v
+MPLBACKEND=Agg python3 -m misc.demo --check    # validates + writes the PNG, exits 0, no server
 ```
-Tests 1–5 validate baseline subtraction, noise averaging, temperature/humidity correction,
-pattern detection, and the full pipeline end-to-end. Each test uses synthetic sensor data
-with a known-answer ground truth (see `sensor_sim.py`).
 
-**Optional: AI-enriched captions (requires OpenAI API key):**
+**Run the web dashboard on its own:**
 ```bash
-export OPENAI_API_KEY=sk-...
-python demo.py
+python3 -m misc.server        # → http://127.0.0.1:5050
 ```
-The caption in `plume_contour.png` will be generated by GPT-4o-mini. Without the key,
-captions use the template automatically.
+`misc/server.py` is a tiny Flask app bound to **127.0.0.1 only** (the OpenAI key stays server-side,
+never reaches the browser). It reuses the existing functions unchanged:
+- `GET  /api/field` → grid + facts JSON (via `explain.compute_field`).
+- `POST /api/caption` `{use_ai}` → `{caption, source, ai_error}` (via `explain.explain_field`).
+- `POST /api/ask` `{question}` → `{answer}` (via `explain.ask_once`).
+- `GET  /api/feasibility` → sweep + verdict (via `feasibility.sweep`/`verdict`).
+- Field-test endpoints under `/api/fieldtests/*` (see "Field-test data collection" above).
+
+Pages served: `/` (Model contour), `/fieldtests.html` (Field Tests — data collection),
+`/explain.html` (How it works). A shared top nav links them; `web/common.js` holds the shared
+helpers + chat widget under `window.CH4`.
+
+**Run the tests:**
+```bash
+pytest tests/ -v        # 102 tests
+```
+`test_processing.py` (Tests 1–5) validates baseline subtraction, noise averaging,
+temperature/humidity correction, pattern detection, and the full pipeline end-to-end.
+`test_plume.py` covers the physics core (σ lookup, ground-reflection form, upwind/calm guards,
+vectorized-vs-scalar equivalence). `test_feasibility.py` pins the fenceline verdict.
+`test_explain.py` pins the caption template + clean AI-absent fallback. `test_server.py` pins
+the shared `compute_field` grid, the JSON API shapes, and graceful degradation when the key
+is absent. `test_db.py` pins the storage layer (SQLite roundtrip, column defaults, cascade
+delete). `test_fieldtest.py` pins CSV parsing, the cleaning pipeline on a known synthetic event,
+and the template interpretation. `test_server_fieldtests.py` pins the field-test API end to end
+(upload, detail, compare, delete, and template/error degradation with the key removed). All new
+tests run on SQLite with no network.
+
+**Optional: AI-enriched captions + chat (requires a valid OpenAI key):**
+```bash
+echo 'OPENAI_API_KEY=sk-...' > .env        # server-side only — never sent to the browser
+python3 -m misc.demo
+```
+With a valid key, the "Explain this graph" caption and the chat widget call GPT-4o-mini.
+Without it (or with an invalid/truncated key → OpenAI 401), the caption falls back to the
+template and the chat returns a clear, human-readable reason — the dashboard never breaks.
 
 ---
 

@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CH₄ Plume · Field Tests</title>
+  <meta name="description"
+        content="Upload, store, and interpret real methane field-test readings." />
+  <link rel="stylesheet" href="styles.css" />
+  <script src="vendor/plotly.min.js"></script>
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <header class="masthead">
+    <div class="masthead__brand">
+      <span class="masthead__sigil" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 17c4 0 4-8 8-8s4 6 8 6" />
+          <path d="M3 21c4 0 4-5 8-5s4 4 8 4" opacity="0.5" />
+          <circle cx="4" cy="13" r="1.4" fill="currentColor" stroke="none" />
+        </svg>
+      </span>
+      <div class="masthead__titles">
+        <h1>CH<sub>4</sub> PLUME <span class="masthead__sep">/</span> FIELD TESTS</h1>
+        <p>Real measured readings · clean → detect → interpret → store</p>
+      </div>
+    </div>
+    <div class="masthead__right">
+      <div class="status" id="backendStatus" title="Where field-test data is stored.">
+        <span class="status__dot status__dot--store" aria-hidden="true"></span>
+        <span class="status__txt" id="backendTxt">STORAGE</span>
+      </div>
+    </div>
+  </header>
+
+  <nav class="subnav" aria-label="primary">
+    <a class="subnav__link" href="/">Model</a>
+    <a class="subnav__link is-active" href="/fieldtests.html" aria-current="page">Field Tests</a>
+    <a class="subnav__link" href="/explain.html">How it works</a>
+  </nav>
+
+  <!-- ── ACQUIRE: upload a CSV / generate a sample ────────────────────────────── -->
+  <section class="acquire panel" style="--d:0">
+    <div class="panel__head">
+      <span class="panel__label">ACQUIRE</span>
+      <span class="panel__sub">upload a readings CSV, or generate a synthetic test to try the flow</span>
+    </div>
+
+    <form class="acq" id="uploadForm">
+      <div class="acq__grid">
+        <label class="field field--wide">
+          <span class="field__k">TEST NAME *</span>
+          <input name="name" required placeholder="Custer fence · run 1" />
+        </label>
+        <label class="field">
+          <span class="field__k">SITE</span>
+          <input name="site" list="siteList" placeholder="Custer Road Transfer Station" />
+          <datalist id="siteList">
+            <option value="Custer Road Transfer Station"></option>
+            <option value="Melissa Landfill"></option>
+          </datalist>
+        </label>
+        <label class="field">
+          <span class="field__k">DATE</span>
+          <input name="test_date" type="date" />
+        </label>
+        <label class="field field--file">
+          <span class="field__k">READINGS CSV *</span>
+          <input name="file" id="fileInput" type="file" accept=".csv,text/csv" required />
+        </label>
+      </div>
+
+      <details class="acq__more">
+        <summary>conditions &amp; processing <span class="acq__hint">(optional — sensible defaults used)</span></summary>
+        <div class="acq__grid acq__grid--more">
+          <label class="field"><span class="field__k">SENSOR DIST (m)</span>
+            <input name="sensor_distance_m" type="number" step="any" placeholder="50" /></label>
+          <label class="field"><span class="field__k">WIND u (m/s)</span>
+            <input name="wind_speed" type="number" step="any" placeholder="2.0" /></label>
+          <label class="field"><span class="field__k">WIND DIR (°)</span>
+            <input name="wind_dir_deg" type="number" step="any" placeholder="270" /></label>
+          <label class="field"><span class="field__k">STABILITY</span>
+            <select name="stability_class">
+              <option value="">—</option>
+              <option value="1">A · very unstable</option>
+              <option value="2">B · unstable</option>
+              <option value="3">C · slightly unstable</option>
+              <option value="4">D · neutral</option>
+              <option value="5">E · slightly stable</option>
+              <option value="6">F · very stable</option>
+            </select></label>
+          <label class="field"><span class="field__k">NOISE FLOOR (ppm)</span>
+            <input name="noise_ppm" type="number" step="any" placeholder="0.30" /></label>
+          <label class="field"><span class="field__k">SAMPLE RATE (Hz)</span>
+            <input name="sample_rate_hz" type="number" step="any" placeholder="1.0" /></label>
+          <label class="field field--wide"><span class="field__k">NOTES</span>
+            <input name="notes" placeholder="weather, equipment, anything worth remembering" /></label>
+        </div>
+      </details>
+
+      <div class="acq__actions">
+        <button class="btn btn--primary" type="submit" id="uploadBtn">
+          <span>Upload &amp; analyse</span>
+        </button>
+        <button class="btn btn--ghost" type="button" id="sampleBtn">Generate sample test</button>
+        <a class="btn btn--ghost" href="/api/sample.csv" download>Download sample CSV</a>
+        <span class="acq__msg" id="acqMsg" role="status"></span>
+      </div>
+    </form>
+  </section>
+
+  <main class="console console--ft">
+    <!-- ── LEFT: the selected test (or compare) readout ──────────────────────── -->
+    <div class="console__left">
+      <section class="panel panel--chart" id="readoutPanel" style="--d:1">
+        <div class="panel__head">
+          <span class="panel__label" id="readoutLabel">READOUT</span>
+          <span class="panel__sub" id="readoutSub">select or upload a field test</span>
+        </div>
+
+        <div class="plot-frame" id="plotFrame">
+          <div id="ftPlot" role="img" aria-label="Field-test time series."></div>
+          <div class="plot-empty" id="ftEmpty">
+            <p>No test selected.</p>
+            <p class="plot-empty__hint">Upload a CSV above, hit <b>Generate sample test</b>,
+               or pick one from the list →</p>
+          </div>
+        </div>
+
+        <ul class="chart-key" id="seriesKey" aria-label="legend" hidden>
+          <li><span class="key-swatch key-swatch--raw"></span>raw reading (ppm, incl. background)</li>
+          <li><span class="key-swatch key-swatch--base"></span>estimated baseline (the removed floor)</li>
+          <li><span class="key-swatch key-swatch--exc"></span>cleaned excess (plume above baseline)</li>
+          <li><span class="key-swatch key-swatch--detect"></span>3σ detection threshold</li>
+          <li><span class="key-swatch key-swatch--event"></span>detected event window</li>
+        </ul>
+      </section>
+
+      <!-- single-test metric cards -->
+      <section class="metrics metrics--ft" id="ftMetrics" style="--d:2" aria-label="readout metrics" hidden>
+        <article class="card" id="cardDetect" data-accent="green">
+          <span class="card__label">DETECTION</span>
+          <span class="card__value" id="mDetected">—</span>
+          <span class="card__hint" id="mDetectedHint">sustained event vs noise</span>
+        </article>
+        <article class="card" data-accent="amber">
+          <span class="card__label">PEAK EXCESS</span>
+          <span class="card__value" id="mExcess">—</span>
+          <span class="card__hint">cleaned ppm above baseline</span>
+        </article>
+        <article class="card" data-accent="blue">
+          <span class="card__label">CONFIDENCE</span>
+          <span class="card__value" id="mConf">—</span>
+          <span class="card__hint">event mean ÷ noise floor</span>
+        </article>
+        <article class="card" data-accent="amber">
+          <span class="card__label">EVENT LENGTH</span>
+          <span class="card__value" id="mDur">—</span>
+          <span class="card__hint">time above threshold</span>
+        </article>
+      </section>
+
+      <!-- compare spread table (shown only in compare mode) -->
+      <section class="panel panel--spread" id="spreadPanel" style="--d:2" hidden>
+        <div class="panel__head"><span class="panel__label">VARIANCE ACROSS TESTS</span>
+          <span class="panel__sub">how repeatable are these runs?</span></div>
+        <div class="spread" id="spreadBody"></div>
+      </section>
+    </div>
+
+    <!-- ── RIGHT: tests list + assistant ─────────────────────────────────────── -->
+    <aside class="console__right">
+      <section class="panel panel--list" id="listPanel" style="--d:1">
+        <div class="panel__head">
+          <span class="panel__label">SAVED TESTS</span>
+          <button class="btn btn--compare" id="compareBtn" type="button" disabled>Compare (0)</button>
+        </div>
+        <div class="testlist" id="testList" aria-live="polite">
+          <p class="testlist__empty">Loading…</p>
+        </div>
+      </section>
+
+      <section class="panel panel--widget" id="assistant" style="--d:2" aria-label="readout assistant">
+        <div class="panel__head">
+          <span class="panel__label">READOUT ASSISTANT</span>
+          <span class="badge badge--idle" id="ftBadge">offline</span>
+        </div>
+        <section class="explain">
+          <button class="btn btn--primary" id="interpretBtn" type="button" disabled>
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor"
+                 stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3a6 6 0 0 0-4 10.5V16h8v-2.5A6 6 0 0 0 12 3Z" />
+              <path d="M9 19h6M10 21h4" />
+            </svg>
+            <span>Interpret this test</span>
+          </button>
+          <p class="caption" id="interpretText">
+            Select a test, then press <b>Interpret this test</b> for a plain-English read —
+            or ask a question below. Every answer is grounded in this test's numbers.
+          </p>
+          <p class="caption-err" id="interpretErr" hidden></p>
+        </section>
+
+        <section class="chat" aria-label="ask about this test">
+          <div class="chat__log" id="ftChatLog" aria-live="polite"></div>
+          <div class="chat__seeds" id="ftChatSeeds"></div>
+          <form class="chat__form" id="ftChatForm">
+            <label class="visually-hidden" for="ftChatInput">Ask about this test</label>
+            <input id="ftChatInput" type="text" autocomplete="off" placeholder="Ask about this test…" />
+            <button class="btn btn--send" id="ftChatSend" type="submit" aria-label="Send question">
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                   stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h13M13 6l6 6-6 6" />
+              </svg>
+            </button>
+          </form>
+        </section>
+      </section>
+    </aside>
+  </main>
+
+  <footer class="footer">
+    <span>Custer Road Transfer Station · Allen TX → Melissa Landfill</span>
+    <span class="footer__note">raw readings stored · cleaning recomputed on read · noise floor assumed</span>
+  </footer>
+
+  <script src="common.js"></script>
+  <script src="fieldtests.js"></script>
+</body>
+</html>

@@ -22,12 +22,16 @@ WHY THREE VALIDATION BLOCKS?
 """
 
 import math
+import os
 import sys
 import textwrap
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")   # PNG artifact only — the interactive graph is now the web dashboard
 import matplotlib.pyplot as plt
 import matplotlib.colors as mcolors
+import matplotlib.patches as mpatches
 from matplotlib.ticker import LogFormatter
 
 from rich import box
@@ -39,7 +43,7 @@ from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
-from plume import (
+from physics.plume import (
     CH4_BACKGROUND,
     U_MIN,
     concentration_gm3,
@@ -54,9 +58,10 @@ from plume import (
 #   feasibility — noise-based "will it work?" sweep + plain-English verdict
 #   explain     — turns the plume grid into a caption (OpenAI, or template fallback)
 #   sensor_sim  — single source of truth for the assumed sensor noise floor
-from feasibility import sweep as feasibility_sweep, verdict as feasibility_verdict, DEFAULT_K
-from explain import explain_field
-from sensor_sim import SENSOR_NOISE_PPM
+from physics.feasibility import sweep as feasibility_sweep, verdict as feasibility_verdict, DEFAULT_K
+from ui import explain  # module import so we can read explain.LAST_AI_ERROR after a call
+from ui.explain import explain_field, compute_field, DEFAULT_SCENARIO
+from physics.sensor_sim import SENSOR_NOISE_PPM
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Rich console — everything goes through this so colours/width stay consistent
@@ -542,39 +547,34 @@ def make_contour_plot() -> None:
     console.print(Rule("[bold]Contour plot[/bold]", style=CLR_ACCENT))
     console.print(f"  [dim]Generating 250×200 receptor grid …[/dim]")
 
-    NX, NY = 250, 200
-    xs = np.linspace(10.0, 200.0, NX)    # downwind axis (m) — table range 10–200 m
-    ys = np.linspace(-150.0, 150.0, NY)  # crosswind axis (m)
-    XX, YY = np.meshgrid(xs, ys)          # shape (NY, NX) each
+    # Single source of truth for the grid + field + facts (explain.compute_field),
+    # shared with the web dashboard and ask.py so every surface describes the exact
+    # same numbers.
+    xs, ys, PPM, facts = compute_field(DEFAULT_SCENARIO, noise_floor=SENSOR_NOISE_PPM)
+    XX, YY = np.meshgrid(xs, ys)          # still needed for contourf/contour below
 
-    # Plot conditions
-    PLOT_Q    = 5.0     # g/s  — representative landfill hotspot
-    PLOT_U    = 3.0     # m/s
-    PLOT_H    = 1.0     # m    — just above ground
-    PLOT_CLS  = 3       # class 3 = C = slightly unstable — common daytime condition
-    PLOT_WIND = 270.0   # FROM west → plume runs east along +x axis
+    # Plot labels pull from the same scenario.
+    PLOT_Q    = DEFAULT_SCENARIO["Q"]                # g/s — representative landfill hotspot
+    PLOT_U    = DEFAULT_SCENARIO["u"]                # m/s
+    PLOT_H    = DEFAULT_SCENARIO["H"]                # m   — just above ground
+    PLOT_CLS  = DEFAULT_SCENARIO["stability_class"]  # class 3 = C, slightly unstable (daytime)
+    PLOT_WIND = DEFAULT_SCENARIO["wind_dir_deg"]     # FROM west → plume runs east along +x
 
-    # Flatten the grid into a (NX*NY, 2) receptor array, run predict_ppm, reshape
-    receptors_flat = np.column_stack([XX.ravel(), YY.ravel()])
-    ppm_flat = predict_ppm(
-        src_pos=(0.0, 0.0), Q=PLOT_Q, u=PLOT_U, wind_dir_deg=PLOT_WIND,
-        H=PLOT_H, stability_class=PLOT_CLS,
-        receptors=receptors_flat, z=0.0,
-    )
-    PPM = ppm_flat.reshape(NY, NX)   # must match meshgrid's (NY, NX) layout
-
-    # ── Auto-explanation: turn the grid into a plain-English caption ──────────
-    # Tries OpenAI when OPENAI_API_KEY is set; otherwise a template summary built
-    # from the numbers. Either way we always get a caption.
-    plot_params = {
-        "Q": PLOT_Q, "u": PLOT_U, "H": PLOT_H,
-        "stability_class": PLOT_CLS, "wind_dir_deg": PLOT_WIND,
-    }
+    # ── Plain-English caption (AI if a key works, else template) ──────────────
+    plot_params = dict(DEFAULT_SCENARIO)
     caption_text, caption_src = explain_field(
         PPM, xs, ys, plot_params, noise_floor=SENSOR_NOISE_PPM,
     )
-    src_label = ("AI (OpenAI)" if caption_src == "openai"
-                 else "template — set OPENAI_API_KEY for an AI version")
+    # Report the caption source honestly. If a key IS set but we still used the
+    # template, say WHY (explain.LAST_AI_ERROR) instead of telling the user to set
+    # a key they already set — usually "no internet" on this machine.
+    if caption_src == "openai":
+        src_label = "AI (OpenAI)"
+    elif os.environ.get("OPENAI_API_KEY"):
+        why = explain.LAST_AI_ERROR or "OpenAI call failed"
+        src_label = f"template (AI unavailable: {why} — caption still valid)"
+    else:
+        src_label = "template — set OPENAI_API_KEY in .env for an AI version"
     console.print(f"  [dim]Explanation source:[/dim] [cyan]{src_label}[/cyan]")
 
     # ── Matplotlib styling ───────────────────────────────────────────────────
@@ -634,13 +634,14 @@ def make_contour_plot() -> None:
     ax.scatter(0, 0, s=120, color='#58a6ff', zorder=6, marker='^',
                label=f'Source  (Q={PLOT_Q} g/s, H={PLOT_H} m)')
 
-    # Wind arrow — points east because φ=270° means wind blows eastward
+    # Wind arrow — points east because φ=270° means wind blows eastward. Placed in
+    # the empty upper-RIGHT band so it never overlaps the Source legend (upper-left).
     ax.annotate(
         '',
-        xy=(70, 132), xytext=(15, 132),
+        xy=(192, 132), xytext=(150, 132),
         arrowprops=dict(arrowstyle='->', color='#58a6ff', lw=2.0),
     )
-    ax.text(42, 141, 'Wind', ha='center', color='#58a6ff', fontsize=9,
+    ax.text(171, 141, 'Wind', ha='center', color='#58a6ff', fontsize=9,
             fontstyle='italic')
 
     # Validity-range annotation — honest about the 10–100 m extrapolation
@@ -666,21 +667,91 @@ def make_contour_plot() -> None:
     ax.set_xlim(xs[0], xs[-1])
     ax.set_ylim(ys[0], ys[-1])
 
-    # ── Plain-English caption box under the plot ──────────────────────────────
-    # Reserve space at the bottom, then drop in the wrapped explanation so the
-    # picture explains itself.
-    fig.subplots_adjust(bottom=0.30, top=0.90)
-    wrapped = textwrap.fill(caption_text, width=120)
-    fig.text(
-        0.02, 0.02, "What this shows:  " + wrapped,
-        color='#c9d1d9', fontsize=8.5, va='bottom', ha='left',
-        family='monospace',
-        bbox=dict(boxstyle='round', facecolor='#161b22', edgecolor='#30363d'),
+    # ── Analysis panel — structured stats + narrative ─────────────────────────
+    # Replaces the old monospace text blob with a dashboard-style panel:
+    #   header row  →  4 colour-coded stat cards  →  centreline decay  →  narrative
+    fig.subplots_adjust(bottom=0.36, top=0.90, left=0.07, right=0.94)
+
+    info_ax = fig.add_axes([0.02, 0.01, 0.96, 0.32])
+    info_ax.set_xlim(0, 1)
+    info_ax.set_ylim(0, 1)
+    info_ax.axis('off')
+    info_ax.set_facecolor('#161b22')
+
+    # Outer border of the panel
+    info_ax.add_patch(mpatches.Rectangle(
+        (0, 0), 1, 1, facecolor='#161b22', edgecolor='#30363d', linewidth=1.0
+    ))
+
+    # ── Header ───────────────────────────────────────────────────────────────
+    info_ax.text(0.013, 0.945, "PLUME ANALYSIS",
+        color='#79c0ff', fontsize=7.5, fontweight='bold',
+        family='monospace', va='top')
+    info_ax.text(0.987, 0.945,
+        f"Q={PLOT_Q} g/s  ·  u={PLOT_U} m/s  ·  H={PLOT_H} m  ·  "
+        f"Class {PLOT_CLS}  ·  {int(PLOT_WIND)}° wind  ·  "
+        f"σ Briggs open-country  ·  caption: {caption_src.split()[0]}",
+        color='#484f58', fontsize=6.5, family='monospace', va='top', ha='right')
+    # Header separator
+    info_ax.plot([0, 1], [0.855, 0.855], color='#30363d', lw=0.8)
+
+    # ── Stat cards ───────────────────────────────────────────────────────────
+    def _fv(v, unit=""): return f"{v:.1f}{unit}" if v is not None else "n/a"
+    reach_val = f"{facts['detect_reach_m']:.0f} m" if facts['detect_reach_m'] else "< grid"
+    hw_val    = f"{facts['half_width_at_50_m']:.0f} m" if facts['half_width_at_50_m'] else "n/a"
+    cards = [
+        ("PEAK CONC",     f"{facts['peak_ppm']:.1f} ppm",     '#79c0ff'),
+        ("DETECT REACH",  reach_val,                           '#3fb950'),
+        ("WIDTH @ 50 m",  hw_val,                              '#79c0ff'),
+        ("THRESHOLD",     f"{facts['threshold']:.2f} ppm",     '#f0883e'),
+    ]
+
+    n_cards  = len(cards)
+    card_pad = 0.010
+    card_w   = (1.0 - card_pad * (n_cards + 1)) / n_cards
+    card_y, card_h = 0.355, 0.475
+
+    for i, (lbl, val, col) in enumerate(cards):
+        cx = card_pad + i * (card_w + card_pad)
+        # Card body
+        info_ax.add_patch(mpatches.Rectangle(
+            (cx, card_y), card_w, card_h,
+            facecolor='#1c2128', edgecolor='#30363d', linewidth=0.6
+        ))
+        # Left accent bar
+        info_ax.add_patch(mpatches.Rectangle(
+            (cx, card_y), card_w * 0.018, card_h, facecolor=col, linewidth=0
+        ))
+        # Metric label (small, dim)
+        info_ax.text(cx + card_w / 2, card_y + card_h * 0.88, lbl,
+            color='#6e7681', fontsize=5.8, ha='center', va='top',
+            fontweight='bold', family='monospace')
+        # Metric value (large, coloured)
+        info_ax.text(cx + card_w / 2, card_y + card_h * 0.44, val,
+            color=col, fontsize=12, ha='center', va='center',
+            fontweight='bold', family='monospace')
+
+    # ── Centreline decay ─────────────────────────────────────────────────────
+    cl_str = (
+        f"centreline:   50 m → {_fv(facts['ppm_at_50'], ' ppm')}"
+        f"     100 m → {_fv(facts['ppm_at_100'], ' ppm')}"
+        f"     200 m → {_fv(facts['ppm_at_200'], ' ppm')}"
     )
+    info_ax.text(0.013, 0.325, cl_str,
+        color='#484f58', fontsize=6.5, va='top', family='monospace')
+
+    # Thin separator before narrative
+    info_ax.plot([0, 1], [0.272, 0.272], color='#21262d', lw=0.5)
+
+    # ── Narrative text ───────────────────────────────────────────────────────
+    narrative = textwrap.fill(caption_text, width=158)
+    info_ax.text(0.013, 0.235, narrative,
+        color='#8b949e', fontsize=7.5, va='top', ha='left',
+        family='monospace', linespacing=1.45)
 
     fig.savefig('plume_contour.png', dpi=150, facecolor=fig.get_facecolor())
     console.print(f"  [green]Saved[/green] [dim]→[/dim] [bold cyan]plume_contour.png[/bold cyan]")
-    plt.show()
+    plt.close(fig)   # never block — the interactive view is the web dashboard (server.py)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -788,7 +859,7 @@ def print_constants() -> None:
         ("T default",           "293.15",  "K",          "20 °C standard"),
         ("P default",           "101,325", "Pa",         "1 atm"),
         ("CH4 background",      "1.9",     "ppm",        "NOAA GML 2023 global mean"),
-        ("σ formulas",          "Briggs 1973", "x,σ in m", "Seinfeld & Pandis (2016) Table 18.2"),
+        ("σ formulas",          "Briggs (1973)", "x,σ in m", "open-country form; see generate_sigma_table.py"),
         ("u_min guard",         "0.5",     "m/s",        "model diverges below this"),
     ]
     for r in rows:
@@ -831,3 +902,39 @@ if __name__ == "__main__":
 
     if not (b1 and b2 and b3 and ba):
         sys.exit(1)
+
+    # ── --check: validation + plume_contour.png only, non-blocking exit 0 ─────
+    # This is the tests / CI contract path (no server, never blocks).
+    if "--check" in sys.argv:
+        console.print()
+        console.print("  [dim]--check: validation + plume_contour.png done — "
+                      "exiting 0 (no server).[/dim]")
+        sys.exit(0)
+
+    # ── Default: serve the interactive dashboard and open the browser ─────────
+    # Replaces the old blocking plt.show(): the presentable graph, the "explain
+    # this graph" caption, and the chat all live in the browser now. The OpenAI
+    # key stays server-side (server.py) — the browser never sees it.
+    import threading
+    import webbrowser
+
+    from misc import server  # imported here so --check / tests never require Flask
+
+    url = f"http://{server.HOST}:{server.PORT}"
+    console.print()
+    console.print(Panel(
+        Text.from_markup(
+            f'Interactive plume · explanation widget · chat are now live:\n\n'
+            f'  [bold bright_cyan]{url}[/bold bright_cyan]\n\n'
+            '[dim]Opening your browser…  press Ctrl+C here to stop the server.[/dim]\n'
+            '[dim](the AI caption/chat need internet + a valid OPENAI_API_KEY in .env;\n'
+            ' without it you still get the template caption and a clear reason.)[/dim]',
+            style="white",
+        ),
+        title="[bold bright_white] Dashboard live [/bold bright_white]",
+        border_style="steel_blue1",
+        padding=(1, 2),
+    ))
+    # Open the browser shortly after the server starts accepting connections.
+    threading.Timer(1.5, lambda: webbrowser.open(url)).start()
+    server.serve()

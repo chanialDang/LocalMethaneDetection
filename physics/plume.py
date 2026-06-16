@@ -30,7 +30,7 @@ UNITS AND CONSTANTS — every one stated with its source
   T  default         293.15       K           20 °C standard temperature
   P  default         101325       Pa          1 atm standard pressure
   CH4_BACKGROUND     1.9          ppm         NOAA GML 2023 global mean
-  σ  coefficients    table        x in m,     otm33a_dispersion_sigma.csv
+  σ  coefficients    table        x in m,     briggs_dispersion_sigma.csv
                      lookup +     σ in m      (Briggs 1973 formulas tabulated
                      interp                    at 1 m steps — see loader note)
   u_min guard        0.5          m/s         below this the model diverges
@@ -49,7 +49,7 @@ import numpy as np
 # ─────────────────────────────────────────────────────────────────────────────
 #
 # Instead of evaluating the Briggs (1973) formulas on the fly, this module now
-# reads pre-computed σ_y / σ_z values from `otm33a_dispersion_sigma.csv` and
+# reads pre-computed σ_y / σ_z values from `briggs_dispersion_sigma.csv` and
 # interpolates between tabulated distances. The CSV is laid out as:
 #
 #     distance_m, sigma_y_class1 … sigma_y_class6, sigma_z_class1 … sigma_z_class6
@@ -58,14 +58,17 @@ import numpy as np
 # (1 = A = very unstable … 6 = F = very stable).
 #
 # PROVENANCE — read this before citing the table anywhere:
-#   The σ values in the shipped CSV are the Briggs (1973) open-country formulas
-#   tabulated at 1-metre steps; they are NOT independent measurements. Switching
-#   from the closed-form formulas to this table changes the *interface* (numeric
-#   classes, lookup + interpolation) but not the physics. If/when a genuinely
-#   different source table is supplied, drop it in at the same path and the rest
-#   of the pipeline is unchanged.
+#   The σ values are the Briggs (1973) open-country formulas evaluated at 1-metre
+#   steps by `generate_sigma_table.py` (run that script to regenerate or audit the
+#   CSV). They are a tabulation of published formulas, NOT independent field
+#   measurements. Reading from a table instead of evaluating the formulas inline
+#   changes the *interface* (integer classes 1–6, lookup + interpolation) but not
+#   the physics. If a genuinely different source table is ever supplied, drop it in
+#   at the same path and the rest of the pipeline is unchanged.
 
 _SIGMA_TABLE = None   # cached dict: distance(float) → {'sigma_y':[6], 'sigma_z':[6]}
+_SIGMA_DIST  = None   # cached np.ndarray (M,)   — sorted tabulated distances
+_SIGMA_COLS  = None   # cached dict: 'sigma_y'/'sigma_z' → np.ndarray (M, 6)
 _N_CLASSES = 6        # Pasquill A–F mapped to integers 1–6
 
 
@@ -80,16 +83,16 @@ def _load_sigma_table() -> dict:
     ------
     FileNotFoundError  if the CSV is missing next to this module.
     """
-    global _SIGMA_TABLE
+    global _SIGMA_TABLE, _SIGMA_DIST, _SIGMA_COLS
     if _SIGMA_TABLE is not None:
         return _SIGMA_TABLE
 
-    csv_path = Path(__file__).parent / "otm33a_dispersion_sigma.csv"
+    csv_path = Path(__file__).parent / "briggs_dispersion_sigma.csv"
     if not csv_path.exists():
         raise FileNotFoundError(
             f"Dispersion-coefficient table not found at {csv_path}. "
-            "sigma_y/sigma_z now read from this CSV instead of computing Briggs "
-            "formulas inline."
+            "Run `python3 generate_sigma_table.py` to (re)create it — sigma_y/"
+            "sigma_z are read from this CSV, not computed inline."
         )
 
     data = {}
@@ -100,6 +103,16 @@ def _load_sigma_table() -> dict:
                 "sigma_y": [float(row[f"sigma_y_class{i}"]) for i in range(1, _N_CLASSES + 1)],
                 "sigma_z": [float(row[f"sigma_z_class{i}"]) for i in range(1, _N_CLASSES + 1)],
             }
+
+    # Pre-build sorted numpy arrays once so every lookup is a vectorizable
+    # np.interp (binary search) instead of re-sorting + linear-scanning the dict
+    # on every call. Columns are stacked (M distances × 6 stability classes).
+    distances = sorted(data.keys())
+    _SIGMA_DIST = np.asarray(distances, dtype=float)
+    _SIGMA_COLS = {
+        "sigma_y": np.asarray([data[d]["sigma_y"] for d in distances], dtype=float),
+        "sigma_z": np.asarray([data[d]["sigma_z"] for d in distances], dtype=float),
+    }
 
     _SIGMA_TABLE = data
     return data
@@ -129,9 +142,9 @@ def _lookup_sigma(x: float, stability_class: int, key: str) -> float:
             f"(1=A … {_N_CLASSES}=F), got {stability_class!r}."
         )
 
-    data = _load_sigma_table()
-    distances = sorted(data.keys())
-    d_min, d_max = distances[0], distances[-1]
+    _load_sigma_table()
+    dist = _SIGMA_DIST
+    d_min, d_max = dist[0], dist[-1]
 
     # Guard the table edges. A tiny epsilon absorbs floating-point overshoot at
     # the boundary (e.g. a coordinate rotation yielding 200.0000000000003 m),
@@ -145,18 +158,10 @@ def _lookup_sigma(x: float, stability_class: int, key: str) -> float:
         )
     x = min(max(x, d_min), d_max)
 
-    class_idx = stability_class - 1
-
-    # Find the bracketing tabulated distances.
-    x_lower = max(d for d in distances if d <= x)
-    x_upper = min(d for d in distances if d >= x)
-    if x_lower == x_upper:
-        return data[x_lower][key][class_idx]
-
-    s_lower = data[x_lower][key][class_idx]
-    s_upper = data[x_upper][key][class_idx]
-    frac = (x - x_lower) / (x_upper - x_lower)
-    return s_lower + frac * (s_upper - s_lower)
+    # np.interp does the bracket-and-linear-interpolate in one binary-search
+    # call; at an exact tabulated distance it returns that row's value verbatim.
+    col = _SIGMA_COLS[key][:, stability_class - 1]
+    return float(np.interp(x, dist, col))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -209,20 +214,19 @@ U_MIN         = 0.5     # m/s — minimum valid wind speed
 #   5 = E = Slightly stable
 #   6 = F = Very stable       (clear night, calm — very little mixing)
 #
-# σ_y and σ_z are read from `otm33a_dispersion_sigma.csv` and linearly
-# interpolated between tabulated distances (see _lookup_sigma above). The
-# shipped table is the Briggs (1973) open-country formulas tabulated at 1 m
-# steps, so the numbers are identical to the old closed-form code up to small
-# interpolation error — the change is one of interface and data source, not
-# physics. The table covers 1–200 m; outside that range the model is undefined
-# and a ValueError is raised. As before, sub-100 m and rough-terrain results
-# are order-of-magnitude estimates only.
+# σ_y and σ_z are read from `briggs_dispersion_sigma.csv` and linearly
+# interpolated between tabulated distances (see _lookup_sigma above). That table
+# is the Briggs (1973) open-country formulas evaluated at 1 m steps by
+# `generate_sigma_table.py`, so a lookup at an exact table distance reproduces the
+# formula value to rounding, and between rows we interpolate linearly. The table
+# covers 1–200 m; outside that range the model is undefined and a ValueError is
+# raised. Sub-100 m and rough-terrain results are order-of-magnitude estimates only.
 
 def sigma_y(x: float, stability_class: int) -> float:
     """
     Crosswind (horizontal) dispersion coefficient σ_y at downwind distance x.
 
-    Looked up from `otm33a_dispersion_sigma.csv` with linear interpolation
+    Looked up from `briggs_dispersion_sigma.csv` with linear interpolation
     between tabulated 1 m distances. The shipped table is the Briggs (1973)
     open-country σ_y values; see the module loader note on provenance.
 
@@ -242,7 +246,7 @@ def sigma_z(x: float, stability_class: int) -> float:
     """
     Vertical dispersion coefficient σ_z at downwind distance x.
 
-    Looked up from `otm33a_dispersion_sigma.csv` with linear interpolation
+    Looked up from `briggs_dispersion_sigma.csv` with linear interpolation
     between tabulated 1 m distances. The shipped table is the Briggs (1973)
     open-country σ_z values; see the module loader note on provenance.
 
@@ -379,6 +383,25 @@ def rotate_to_wind_frame(
 #                                 When H=0, both terms equal 1, so the 2 in
 #                                 the denominator cancels → C = Q/(π σ_y σ_z u).
 
+def _plume_shape(y, H, sy, sz, z=0.0):
+    """
+    Dimensionless Gaussian shape factor: crosswind bell × (real + image) vertical.
+
+    Single source of truth for the plume's spatial profile, shared by the scalar
+    ``concentration_gm3`` and the vectorized ``predict_ppm``. Uses ``np.exp`` so
+    it works transparently on Python floats or numpy arrays.
+
+        term_y = exp(−y²/2σ_y²)                           crosswind bell curve
+        term_z = exp(−(z−H)²/2σ_z²) + exp(−(z+H)²/2σ_z²)   real source + ground image
+
+    At y=0, term_y=1; at H=z=0, term_z=2 (the perfectly reflecting ground doubles
+    the surface concentration). Returns term_y · term_z.
+    """
+    term_y = np.exp(-0.5 * (y / sy) ** 2)
+    term_z = np.exp(-0.5 * ((z - H) / sz) ** 2) + np.exp(-0.5 * ((z + H) / sz) ** 2)
+    return term_y * term_z
+
+
 def concentration_gm3(
     x: float,
     y: float,
@@ -428,25 +451,17 @@ def concentration_gm3(
             "Concentration diverges as u→0; use a puff model for calm conditions."
         )
 
-    # ── Crosswind (horizontal) bell-curve factor ──
-    # This is 1.0 at y=0 (centreline) and decreases to ~0.6 at y=σ_y,
-    # ~0.14 at y=2σ_y, reaching ~0 by y=3σ_y.
-    term_y = math.exp(-0.5 * (y / sy) ** 2)
-
-    # ── Vertical bell-curve factor (real source + ground reflection image) ──
-    # exp(−(z−H)²/2σ_z²)  →  real source contribution
-    # exp(−(z+H)²/2σ_z²)  →  reflected image source contribution
-    # When H=0: both equal exp(0) = 1 → term_z = 2
-    term_z = (
-        math.exp(-0.5 * ((z - H) / sz) ** 2) +
-        math.exp(-0.5 * ((z + H) / sz) ** 2)
-    )
+    # ── Crosswind × vertical Gaussian shape (see _plume_shape) ──
+    #   term_y: 1.0 at the centreline, falling to ~0.6 at σ_y and ~0 by 3σ_y.
+    #   term_z: real source + ground-reflection image; equals 2 at H=z=0.
+    shape = _plume_shape(y, H, sy, sz, z)
 
     # ── Assemble the full Gaussian plume formula ──
     # The 2π in the denominator + term_z=2 at H=0 combine to give π,
     # matching the simpler "ground-level with reflection" formula you often
-    # see written as  C = Q / (π σ_y σ_z u).
-    return Q / (2.0 * math.pi * sy * sz * u) * term_y * term_z
+    # see written as  C = Q / (π σ_y σ_z u). float() keeps the scalar API
+    # returning a plain Python float (np.exp yields a numpy scalar).
+    return float(Q / (2.0 * math.pi * sy * sz * u) * shape)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,6 +534,7 @@ def predict_ppm(
     T_K: float = 293.15,
     P_Pa: float = 101325.0,
     z: float = 0.0,
+    clamp_to_table: bool = False,
 ) -> np.ndarray:
     """
     Predict total CH4 (ppm) at every receptor, including 1.9 ppm background.
@@ -546,11 +562,39 @@ def predict_ppm(
     T_K            : air temperature (K); default 293.15 K
     P_Pa           : air pressure (Pa); default 101325 Pa
     z              : sensor height above ground (m); default 0.0
+    clamp_to_table : OPTIMIZER-SAFE MODE. Default False (strict). When True, a
+                     downwind distance outside the σ table's 1–200 m band is
+                     handled gracefully instead of raising ValueError:
+                       • < 1 m   → clamped up to the 1 m floor (degenerate
+                                   near-source point; the sub-100 m model is
+                                   order-of-magnitude only regardless).
+                       • > 200 m → returned as background only (a source that
+                                   far is effectively undetectable here, so a
+                                   pure-background reading is the honest answer).
+                     Set this True for the Week-3 inversion: scipy.optimize
+                     freely probes source positions that put a sensor <1 m or
+                     >200 m downwind, and a single such evaluation would
+                     otherwise crash the whole optimisation. Keep it False for
+                     demo/validation runs so out-of-range geometry is a hard
+                     error you notice.
 
     Returns
     -------
     np.ndarray  shape (N,) — total CH4 in ppm (plume contribution + background).
     Upwind receptors return exactly CH4_BACKGROUND = 1.9 ppm.
+
+    Notes for the inversion optimizer
+    ---------------------------------
+    These are FIXED, known inputs here, not fit parameters — but the optimizer
+    that wraps this function must respect them or it will hit the raises above:
+      • u must stay ≥ U_MIN (0.5 m/s). If wind ever becomes a fit parameter,
+        bound it; otherwise the calm-wind guard raises.
+      • stability_class is a discrete integer 1–6 — fix it or loop over it, do
+        not let a continuous optimizer vary it.
+      • Q ≥ 0 is physical; bound it in the optimizer (negative Q yields negative
+        plume here, which is silently unphysical rather than an error).
+    With clamp_to_table=True plus those bounds, predict_ppm is total-input-safe:
+    no geometry the optimizer can wander into will raise.
     """
     if not (isinstance(stability_class, (int, np.integer)) and 1 <= stability_class <= 6):
         raise ValueError(
@@ -562,27 +606,71 @@ def predict_ppm(
     receptors = np.atleast_2d(np.asarray(receptors, dtype=float))
     n = len(receptors)
 
-    # Start every receptor at background concentration — upwind ones stay here
+    # Start every receptor at background concentration — upwind ones stay here.
     result = np.full(n, CH4_BACKGROUND, dtype=float)
 
-    for i in range(n):
-        rx, ry = receptors[i, 0], receptors[i, 1]
+    # ── Step 1: rotate every receptor into the wind frame at once ──
+    # Vectorized form of rotate_to_wind_frame (see that function's derivation).
+    phi = math.radians(wind_dir_deg)
+    sin_p, cos_p = math.sin(phi), math.cos(phi)
+    dx = receptors[:, 0] - src_x
+    dy = receptors[:, 1] - src_y
+    xw = dx * (-sin_p) + dy * (-cos_p)   # downwind component (+ = downwind)
+    yw = dx * ( cos_p) + dy * (-sin_p)   # crosswind component
 
-        # Step 1: rotate from map frame to wind-aligned frame
-        xw, yw = rotate_to_wind_frame(rx, ry, src_x, src_y, wind_dir_deg)
+    # ── Step 2: only downwind receptors (xw > 0) see the plume ──
+    down = xw > 0.0
+    if not np.any(down):
+        return result          # all upwind → background everywhere
 
-        # Step 2: skip upwind receptors — the plume doesn't reach them
-        if xw <= 0.0:
-            continue  # result[i] stays at CH4_BACKGROUND
+    # The u guard lives here (after the all-upwind short-circuit) so a calm-wind
+    # call with no downwind receptors still returns cleanly, matching the old
+    # per-receptor behaviour where concentration_gm3 was simply never reached.
+    if u < U_MIN:
+        raise ValueError(
+            f"Wind speed u={u} m/s is below the model minimum ({U_MIN} m/s). "
+            "Concentration diverges as u→0; use a puff model for calm conditions."
+        )
 
-        # Step 3: how wide/tall is the plume at this downwind distance?
-        sy = sigma_y(xw, stability_class)
-        sz = sigma_z(xw, stability_class)
+    xw_d = xw[down]
+    yw_d = yw[down]
 
-        # Step 4: raw mass concentration from the Gaussian formula
-        C = concentration_gm3(xw, yw, Q, u, H, sy, sz, z)
+    # ── Step 3: σ_y, σ_z for every downwind point in two np.interp calls ──
+    _load_sigma_table()
+    dist = _SIGMA_DIST
+    d_min, d_max = dist[0], dist[-1]
+    eps = 1e-6
 
-        # Steps 5–6: convert units and add background
-        result[i] = gm3_to_ppm_methane(C, T_K, P_Pa) + CH4_BACKGROUND
+    if clamp_to_table:
+        # Optimizer-safe geometry handling (see clamp_to_table in the docstring).
+        # Points beyond the far edge get no plume (masked back to background);
+        # points inside the near edge are clamped up to the 1 m floor. Nothing
+        # raises, so scipy.optimize can probe any source position without crashing.
+        in_range = xw_d <= d_max + eps     # near side is rescued by the clamp below
+        xc = np.clip(xw_d, d_min, d_max)
+    else:
+        # Strict mode (default): any geometry outside the tabulated band is a
+        # hard error so demo/validation runs surface it immediately.
+        if np.any(xw_d < d_min - eps) or np.any(xw_d > d_max + eps):
+            bad = xw_d[(xw_d < d_min - eps) | (xw_d > d_max + eps)]
+            raise ValueError(
+                f"Downwind distance {bad.min():.4f} m is outside the tabulated "
+                f"range [{d_min:g}, {d_max:g}] m. The model is only defined where "
+                f"the σ table has data."
+            )
+        in_range = np.ones(xw_d.shape, dtype=bool)
+        xc = np.clip(xw_d, d_min, d_max)
+
+    ci = stability_class - 1
+    sy = np.interp(xc, dist, _SIGMA_COLS["sigma_y"][:, ci])
+    sz = np.interp(xc, dist, _SIGMA_COLS["sigma_z"][:, ci])
+
+    # ── Steps 4–6: Gaussian plume → g/m³ → ppm → add background ──
+    C = Q / (2.0 * math.pi * sy * sz * u) * _plume_shape(yw_d, H, sy, sz, z)
+    ppm_down = C * (R_GAS * T_K) / (M_CH4 * P_Pa) * 1.0e6 + CH4_BACKGROUND
+
+    # Far-field points (clamp mode only) fall back to background; everything in
+    # range keeps its plume value. In strict mode in_range is all-True (no-op).
+    result[down] = np.where(in_range, ppm_down, CH4_BACKGROUND)
 
     return result

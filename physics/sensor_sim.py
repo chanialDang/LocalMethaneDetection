@@ -54,6 +54,17 @@ import numpy as np
 SENSOR_NOISE_PPM = 0.30      # ppm — random reading-to-reading jitter (1σ).
                              # This IS the "noise floor": a plume smaller than a
                              # few times this is hard to distinguish from noise.
+                             # KEY: this is the RANDOM part — averaging N samples
+                             # shrinks it as 1/√N (see effective_noise_floor).
+
+BIAS_FLOOR_PPM = 0.00        # ppm — the NON-random part of the error: slow drift,
+                             # calibration offset, weather residual left after
+                             # correction. Crucially, averaging does NOT remove it.
+                             # Left at 0 by default (so nothing changes), but the
+                             # field value is what really limits detection: a sensor
+                             # with a 5 ppm calibration RMSE cannot be averaged down
+                             # to 0.5 ppm if most of that 5 ppm is bias. ASSUMED —
+                             # set from measured Figaro data once it exists.
 
 DETECT_K = 3.0               # detection strictness: a signal must beat
                              # DETECT_K × SENSOR_NOISE_PPM to count as clearly
@@ -79,6 +90,40 @@ DEFAULT_SAMPLE_RATE_HZ = 1.0  # one reading per second by default.
 # Background methane is duplicated here (rather than imported from plume.py) so
 # this module stays standalone; the value is the same NOAA GML 2023 mean.
 CH4_BACKGROUND_PPM = 1.9
+
+
+def effective_noise_floor(
+    random_ppm: float = SENSOR_NOISE_PPM,
+    bias_ppm: float = BIAS_FLOOR_PPM,
+    n_avg: int = 1,
+) -> float:
+    """
+    Realistic detection floor (ppm, 1σ) after averaging ``n_avg`` samples.
+
+    A sensor's error has two parts that behave OPPOSITELY under averaging:
+
+      • RANDOM jitter (``random_ppm``) — independent each sample, so averaging
+        N samples shrinks it as 1/√N (the classic "noise beats down" win).
+      • BIAS / drift / calibration offset (``bias_ppm``) — essentially the SAME
+        in every sample, so averaging does NOT reduce it at all.
+
+    The combined 1σ floor adds them in quadrature::
+
+        floor = √[ (random_ppm / √n_avg)² + bias_ppm² ]
+
+    This is exactly why you cannot average your way to an arbitrarily small
+    detection limit: past some N the bias term dominates and more averaging buys
+    nothing. (It is also the correction to the common mistake of dividing a whole
+    calibration RMSE by √N — only the random part earns that.) With the defaults
+    (bias 0, n_avg 1) it returns ``random_ppm`` unchanged, so existing behaviour
+    is preserved.
+    """
+    if n_avg < 1:
+        raise ValueError(f"n_avg must be ≥ 1, got {n_avg}")
+    if random_ppm < 0 or bias_ppm < 0:
+        raise ValueError("noise terms must be non-negative")
+    random_part = random_ppm / np.sqrt(n_avg)
+    return float(np.hypot(random_part, bias_ppm))
 
 
 @dataclass

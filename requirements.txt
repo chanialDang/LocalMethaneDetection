@@ -2,6 +2,10 @@ numpy
 matplotlib
 rich
 
+# Local web dashboard backend (server.py / `python3 demo.py`). Flask 3.x supports
+# Python 3.9; capped conservatively. Plotly is vendored as static JS, not a pip dep.
+flask>=3.0,<3.2
+
 # Testing (run: pytest tests/ -v)
 pytest
 
@@ -9,3 +13,15 @@ pytest
 # Without it (or without an OPENAI_API_KEY), the code falls back to a
 # template explanation automatically, so this is safe to skip.
 openai
+
+# Field-test persistence (db.py). When DATABASE_URL is set the app talks to a
+# Railway Postgres via psycopg (imported lazily — only loaded when DATABASE_URL
+# actually points at Postgres). When DATABASE_URL is unset it falls back to a local
+# SQLite file (Python stdlib, nothing to install), so this is safe to skip for
+# local-only use.
+psycopg[binary]>=3.1
+
+# Optional — ONLY for the "deploy the whole app to Railway" path (see Procfile).
+# The local-app + Railway-Postgres setup (python3 server.py / demo.py) does not
+# need this.
+gunicorn

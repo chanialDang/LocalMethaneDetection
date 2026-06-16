@@ -1,0 +1,15 @@
+# Secrets — NEVER commit. Holds OPENAI_API_KEY for explain.py's optional AI captions.
+.env
+
+# Python bytecode / caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local field-test database — created when DATABASE_URL is unset (SQLite fallback).
+# Real persistence lives in Railway Postgres; this local file is per-machine only.
+fieldtests.db
+fieldtests.db-journal
+
+# Note: briggs_dispersion_sigma.csv and plume_contour.png are intentionally
+# tracked — the CSV is a runtime dependency of plume.py, the PNG is demo output.

@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>CH₄ Plume · How it works</title>
+  <meta name="description" content="Plain-English guide to the methane plume model and field-test pipeline." />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <header class="masthead">
+    <div class="masthead__brand">
+      <span class="masthead__sigil" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="22" height="22" fill="none" stroke="currentColor"
+             stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 17c4 0 4-8 8-8s4 6 8 6" />
+          <path d="M3 21c4 0 4-5 8-5s4 4 8 4" opacity="0.5" />
+          <circle cx="4" cy="13" r="1.4" fill="currentColor" stroke="none" />
+        </svg>
+      </span>
+      <div class="masthead__titles">
+        <h1>CH<sub>4</sub> PLUME <span class="masthead__sep">/</span> HOW IT WORKS</h1>
+        <p>The physics, the cleaning pipeline, and how real readings flow through</p>
+      </div>
+    </div>
+  </header>
+
+  <nav class="subnav" aria-label="primary">
+    <a class="subnav__link" href="/">Model</a>
+    <a class="subnav__link" href="/fieldtests.html">Field Tests</a>
+    <a class="subnav__link is-active" href="/explain.html" aria-current="page">How it works</a>
+  </nav>
+
+  <main class="doc">
+    <p class="doc__lede" style="--d:0">
+      This project detects faint <b>methane (CH₄)</b> near a fenceline using a low-cost
+      Figaro MOX sensor. There are two halves: a <b>forward model</b> that predicts what a
+      plume looks like, and a <b>field-test tool</b> that takes in real sensor readings,
+      cleans them, decides whether a plume was detected, and stores the result.
+    </p>
+
+    <!-- the key conceptual clarifier -->
+    <section class="panel" style="--d:1">
+      <div class="panel__head"><span class="panel__label">TWO SHAPES OF DATA</span>
+        <span class="panel__sub">why the model graph and a real reading look different</span></div>
+      <div class="compare2">
+        <div class="compare2__cell compare2__cell--model">
+          <h3>▣ THE MODEL — a field over space</h3>
+          <p>Given a guessed source, wind, and weather, the model predicts methane at
+             <b>every point on a map</b> at once. That is the smooth contour on the
+             <a href="/" class="doc-link">Model</a> page — a time-averaged snapshot.</p>
+        </div>
+        <div class="compare2__cell compare2__cell--data">
+          <h3>◷ A REAL READING — a series over time</h3>
+          <p>A single sensor sits in <b>one spot</b> and reports ppm <b>over time</b>. You
+             see a plume as a <b>bump</b> rising out of the background as the wind carries it
+             past. That is what each <a href="/fieldtests.html" class="doc-link">Field Test</a> graph shows.</p>
+        </div>
+      </div>
+      <p style="margin-top:12px;">So real measurements live on a <b>ppm-vs-time</b> graph — one per field test —
+         not directly on the map. The map stays the <b>model/reference</b>; later (the Week-3
+         inversion) real data can estimate the source and put it back on the map.</p>
+    </section>
+
+    <!-- forward model -->
+    <section class="panel" style="--d:2">
+      <div class="panel__head"><span class="panel__label">THE FORWARD MODEL</span>
+        <span class="panel__sub">steady-state Gaussian plume · Briggs (1973) σ</span></div>
+      <div class="eq">C = Q / (2π·σ_y·σ_z·u)
+    · exp(−y² / 2σ_y²)
+    · [ exp(−(z−H)² / 2σ_z²) + exp(−(z+H)² / 2σ_z²) ]</div>
+      <p>Concentration falls off as the plume spreads (the σ widths grow with distance) and
+         as wind <code>u</code> dilutes it. The last bracket is <b>ground reflection</b> — the
+         ground acts like a mirror. The knobs:</p>
+      <p>
+        <code>Q</code> emission rate (g/s) — everything scales with it; the main unknown the
+        inversion will solve for. &nbsp;·&nbsp;
+        <code>u</code> wind speed (m/s) — more wind, more dilution. &nbsp;·&nbsp;
+        <code>H</code> release height (m). &nbsp;·&nbsp;
+        <code>stability</code> A–F — how turbulent the air is (sets how fast σ grows). &nbsp;·&nbsp;
+        <code>wind_dir</code> the from-direction that aims the plume.
+      </p>
+      <p>Background CH₄ is <b>1.9 ppm</b> (NOAA); the signal of interest is only a few ppm
+         above that. Operating range is roughly <b>10–200 m</b>, and sub-100 m values are
+         order-of-magnitude only (the open-country formulas were validated farther out).</p>
+    </section>
+
+    <!-- pipeline -->
+    <section class="panel" style="--d:3">
+      <div class="panel__head"><span class="panel__label">CLEANING A REAL READING</span>
+        <span class="panel__sub">four steps pull the tiny signal out of the mess</span></div>
+      <div class="steps">
+        <div class="step"><span class="step__n">1</span><div class="step__b">
+          <h3>Weather correction</h3>
+          <p>MOX sensors drift with temperature &amp; humidity. If those columns are in your
+             CSV, we fit and subtract the weather-driven part first.</p></div></div>
+        <div class="step"><span class="step__n">2</span><div class="step__b">
+          <h3>Baseline subtraction</h3>
+          <p>A slow rolling low-percentile estimates the wandering “zero”. What’s left is the
+             <b>excess</b> above the local floor — the plume.</p></div></div>
+        <div class="step"><span class="step__n">3</span><div class="step__b">
+          <h3>Smoothing</h3>
+          <p>A centred moving average shrinks random noise by ~√N while a real, sustained
+             bump survives.</p></div></div>
+        <div class="step"><span class="step__n">4</span><div class="step__b">
+          <h3>Detection</h3>
+          <p>We flag an event only when the excess stays above <b>3× the noise floor</b> for
+             several samples in a row — one spike is just noise.</p></div></div>
+      </div>
+    </section>
+
+    <!-- detection + caveat -->
+    <section class="panel" style="--d:4">
+      <div class="panel__head"><span class="panel__label">DETECTION &amp; THE NOISE FLOOR</span>
+        <span class="panel__sub">the one number everything hinges on</span></div>
+      <p>“Detectable” means the cleaned excess clears <code>3 × noise floor</code>. With the
+         assumed <b>0.30 ppm</b> floor that threshold is <b>0.90 ppm</b> — the same cutoff used
+         on the model graph, in the feasibility sweep, and in every field test, so the answer
+         is consistent everywhere.</p>
+      <p><b>Important caveat:</b> that 0.30 ppm noise floor is an <b>assumed placeholder</b>
+         until the real Figaro is characterised. The whole detection margin moves once it’s
+         measured — which is exactly why each field test lets you set its own noise floor, and
+         why the harder, lower-ppm <b>Melissa</b> site is the real test of the design.</p>
+    </section>
+
+    <!-- flow -->
+    <section class="panel" style="--d:5">
+      <div class="panel__head"><span class="panel__label">HOW A FIELD TEST FLOWS</span>
+        <span class="panel__sub">CSV in → interpretation out → stored</span></div>
+      <div class="flow">
+        <span class="flow__node">Upload CSV</span><span class="flow__arrow">▸</span>
+        <span class="flow__node">Store raw readings</span><span class="flow__arrow">▸</span>
+        <span class="flow__node">Clean &amp; detect</span><span class="flow__arrow">▸</span>
+        <span class="flow__node">Graph + metrics</span><span class="flow__arrow">▸</span>
+        <span class="flow__node">AI interpretation</span><span class="flow__arrow">▸</span>
+        <span class="flow__node">Compare runs</span>
+      </div>
+      <p style="margin-top:12px;">Only the <b>raw</b> readings are stored; the cleaning is recomputed each time you open a
+         test, so settings (like the noise floor) can be retuned without re-uploading. Data
+         persists in <b>Railway Postgres</b> when configured, or a local file otherwise.</p>
+    </section>
+
+    <!-- chat -->
+    <section class="panel panel--widget" style="--d:6; position: static; min-height: 0; max-height: none;"
+             aria-label="ask the assistant">
+      <div class="panel__head">
+        <span class="panel__label">ASK ANYTHING</span>
+        <span class="badge badge--idle" id="docBadge">assistant</span>
+      </div>
+      <p class="caption">Questions are grounded in this project’s physics, code, and the
+         model’s current numbers. Needs internet + a valid key on the server, otherwise you’ll
+         get a clear reason.</p>
+      <section class="chat" aria-label="ask a question">
+        <div class="chat__log" id="docChatLog" aria-live="polite"></div>
+        <div class="chat__seeds" id="docChatSeeds"></div>
+        <form class="chat__form" id="docChatForm">
+          <label class="visually-hidden" for="docChatInput">Ask a question</label>
+          <input id="docChatInput" type="text" autocomplete="off" placeholder="Ask about the model or pipeline…" />
+          <button class="btn btn--send" id="docChatSend" type="submit" aria-label="Send question">
+            <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor"
+                 stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M5 12h13M13 6l6 6-6 6" />
+            </svg>
+          </button>
+        </form>
+      </section>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <span>Gaussian plume · Briggs (1973) σ · Figaro TGS 2611-E00</span>
+    <span class="footer__note">steady-state · open-country σ · noise floor assumed</span>
+  </footer>
+
+  <script src="common.js"></script>
+  <script>
+    'use strict';
+    const badge = document.getElementById('docBadge');
+    CH4.mountChat({
+      logEl: document.getElementById('docChatLog'),
+      formEl: document.getElementById('docChatForm'),
+      inputEl: document.getElementById('docChatInput'),
+      sendEl: document.getElementById('docChatSend'),
+      seedsEl: document.getElementById('docChatSeeds'),
+      seeds: ['What is a Gaussian plume?',
+              'Why use the sensor below its rated range?',
+              'What does the 3σ threshold mean?',
+              'Why is sub-100 m only an estimate?'],
+      endpoint: () => '/api/ask',
+      buildBody: (q) => ({ question: q }),
+      onSource: (src) => {
+        badge.classList.remove('badge--idle', 'badge--ai', 'badge--tmpl');
+        if (src === 'openai') { badge.classList.add('badge--ai'); badge.textContent = 'AI · OpenAI'; }
+        else { badge.classList.add('badge--tmpl'); badge.textContent = 'Template'; }
+      },
+    });
+  </script>
+</body>
+</html>

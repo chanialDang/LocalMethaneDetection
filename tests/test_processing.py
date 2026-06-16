@@ -15,13 +15,13 @@ Run them all with:   pytest tests/ -v
 
 import numpy as np
 
-from processing import (
+from physics.processing import (
     moving_average,
     subtract_baseline,
     temp_humidity_correct,
     detect_pattern,
 )
-from sensor_sim import synthetic_timeseries, make_plume_event
+from physics.sensor_sim import synthetic_timeseries, make_plume_event
 
 
 # ─────────────────────────────────────────────────────────────────────────────
