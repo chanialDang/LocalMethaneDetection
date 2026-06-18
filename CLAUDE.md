@@ -26,7 +26,7 @@ worst case, not just the stronger Custer signal.
 
 ## Current status (Week 2 — validated green)
 
-- `python3 -m pytest tests/ -v` → **102/102 PASS**. `python3 -m misc.demo` now runs validation,
+- `python3 -m pytest tests/ -v` → **115/115 PASS**. `python3 -m misc.demo` now runs validation,
   saves `plume_contour.png`, then **serves the interactive web dashboard** at
   `http://127.0.0.1:5050` and opens the browser (Ctrl+C to stop). For a non-blocking,
   exit-0 run (tests/CI) use **`MPLBACKEND=Agg python3 -m misc.demo --check`** — it validates +
@@ -121,6 +121,7 @@ LocalMethaneDetection/
 │   ├── sensor_sim.py              #   Synthetic sensor data: truth + noise + weather
 │   ├── processing.py              #   Signal cleaning: baseline, averaging, T-H, detection
 │   ├── feasibility.py             #   Forward-model sweep + detectability verdict
+│   ├── accuracy.py                #   Accuracy framework: self-measured noise, recovery, LOD/Q, CRB, grade
 │   ├── fieldtest.py               #   REAL readings: CSV parse + cleaning pipeline + sample gen
 │   ├── generate_sigma_table.py    #   Regenerates the σ table from Briggs (1973) formulas
 │   └── briggs_dispersion_sigma.csv#   Briggs σ lookup table (1–200 m, 6 classes A–F)
@@ -148,13 +149,15 @@ LocalMethaneDetection/
 ├── tests/test_db.py               # Pytest — storage layer (SQLite roundtrip, cascade delete)
 ├── tests/test_fieldtest.py        # Pytest — CSV parse + cleaning pipeline + interpret
 ├── tests/test_server_fieldtests.py# Pytest — field-test API (upload/detail/compare/degrade)
+├── tests/test_accuracy.py         # Pytest — accuracy framework (noise/recovery/LOD/CRB/grade)
 ├── conftest.py                    # Pytest config — puts the project root on sys.path
 ├── samples/custer_sample.csv      # Example readings CSV (from sensor_sim) — try the upload flow
 ├── plume_contour.png              # Static figure from demo.py (with caption box)
 ├── Procfile                       # OPTIONAL — deploy the whole app to Railway (gunicorn misc.server:app)
 ├── requirements.txt               # numpy, matplotlib, rich, flask, pytest; openai/psycopg/gunicorn (opt)
 ├── CLAUDE.md                      # This file (architecture & API docs)
-└── EXPLANATION.md                 # Plain-English project overview
+├── EXPLANATION.md                 # Plain-English project overview
+└── ACCURACY.md                    # Accuracy framework: protocol, math, grading, worked example
 ```
 
 **Path notes (so moves don't break):** `physics/plume.py` and
@@ -340,6 +343,29 @@ consistent everywhere in the project.
 
 ---
 
+## Accuracy framework (`accuracy.py`)
+
+Answers **"how accurate is this, and how accurate could it ever be?"** as one
+ordered protocol. Reuses `processing.py`, `sensor_sim.py`, `feasibility.py`, and
+`plume.py` — no physics is reimplemented. Full method + math + worked example live
+in **`ACCURACY.md`**; this is the API summary.
+
+| Function | Returns | Purpose |
+|----------|---------|---------|
+| `estimate_noise_floor(excess_unsmoothed, detection)` | `NoiseEstimate` | **(1) Characterize** — measure real noise from the quiet samples: `random_ppm` (successive-diff, averages as 1/√N) + `bias_ppm` (slow-residual **proxy**). Feed it `raw − baseline`. |
+| `recovery_metrics(true_ppm, recovered_excess, detection, time)` | `RecoveryReport` | **(2) Validate** — RMSE/bias/%recovery/R²/correlation + detection outcome + timing error vs known synthetic truth. |
+| `detection_limit(random_ppm, bias_ppm, distance, …)` | `DetectionLimit` | **(4a) Bound, empirical** — LOD/LOQ + minimum detectable Q with a wind/stability `swing_factor` error bar (back-solved via `feasibility`), plus the averaging curve + bias crossover. |
+| `crb_source_bound(src_pos, Q, …, receptors, sigma_ppm, params)` | `CRBound` | **(4b) Bound, theoretical** — Cramér-Rao lower bound on a source fix from the Fisher information (numerical Jacobian of `predict_ppm`). Standalone now; Week-3 compares its scatter to it. |
+| `accuracy_report(result, meta, true_ppm=None)` | `dict` (JSON-safe) | **(3+5) Quantify+Grade** — measured-vs-assumed floor, SNR, detection limit, optional recovery, a **0–100 score + letter grade + one recommendation**. Shaped to drop into `summarize_fieldtest` facts. |
+
+**Two-part error model (single source of truth):** random noise averages down as
+1/√N; bias/drift does not. `accuracy.py` reuses `sensor_sim.effective_noise_floor`
+(random ÷√N ⊕ bias, in quadrature) so the "best you can do" floor is consistent
+with the feasibility verdict. **Honesty caveat:** in-record `bias_ppm` is a proxy;
+the rigorous value needs a lab zero-air run — until then it tracks residual drift.
+
+---
+
 ## Explanation and visualization (`explain.py`)
 
 Turns the plume field into a human-readable caption. Two paths:
@@ -482,7 +508,7 @@ helpers + chat widget under `window.CH4`.
 
 **Run the tests:**
 ```bash
-pytest tests/ -v        # 102 tests
+pytest tests/ -v        # 115 tests
 ```
 `test_processing.py` (Tests 1–5) validates baseline subtraction, noise averaging,
 temperature/humidity correction, pattern detection, and the full pipeline end-to-end.
@@ -493,8 +519,11 @@ the shared `compute_field` grid, the JSON API shapes, and graceful degradation w
 is absent. `test_db.py` pins the storage layer (SQLite roundtrip, column defaults, cascade
 delete). `test_fieldtest.py` pins CSV parsing, the cleaning pipeline on a known synthetic event,
 and the template interpretation. `test_server_fieldtests.py` pins the field-test API end to end
-(upload, detail, compare, delete, and template/error degradation with the key removed). All new
-tests run on SQLite with no network.
+(upload, detail, compare, delete, and template/error degradation with the key removed).
+`test_accuracy.py` pins the accuracy framework (self-measured noise recovers the injected
+0.30 ppm, recovery metrics on a known event, the LOD→min-detectable-Q back-solve, the
+averaging crossover, clean-vs-noisy grading, and the Cramér-Rao bound's monotonicity + σ
+scaling). All new tests run on SQLite with no network.
 
 **Optional: AI-enriched captions + chat (requires a valid OpenAI key):**
 ```bash

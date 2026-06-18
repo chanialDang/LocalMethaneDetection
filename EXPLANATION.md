@@ -237,3 +237,14 @@ No sensor yet? Hit **Generate sample test** (or download the sample CSV) to walk
 the whole flow with realistic synthetic data first. See `CLAUDE.md` →
 "Field-test data collection" for the API and the one-line Railway `DATABASE_URL`
 setup.
+
+## Knowing how accurate it is (the Accuracy framework)
+
+A detection is only worth as much as our confidence in it. `physics/accuracy.py`
+answers four questions, in order: it **measures** the sensor's real noise from the
+data (splitting the part that averages away from the part that doesn't),
+**validates** how well the pipeline recovers a known synthetic signal, reports the
+**best leak detectable now** (with a wind/stability error bar) *and* the
+**theoretically best-possible** source fix (the Cramér-Rao bound), then **grades**
+the whole thing 0–100 with one recommended next step. The full method, the math,
+and a worked example are in **`ACCURACY.md`**.
