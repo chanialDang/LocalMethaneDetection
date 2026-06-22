@@ -41,6 +41,36 @@ more averaging buys almost nothing — the framework reports that crossover.
 
 ---
 
+## Two averaging roles (don't conflate them)
+
+"Averaging" gets used for two different jobs in this project. Keeping them apart is
+what makes the Week-3 inversion honest:
+
+| | **Noise averaging (√N)** | **Meander averaging (time-mean)** |
+|---|---|---|
+| Goal | shrink random jitter | match the model's *time-mean* picture |
+| Window | a few samples | a meteorological window (~10 min–1 hr) |
+| Helps with | random noise only | turbulent intermittency (gusts, plume meander) |
+| Stops helping when | bias dominates (the crossover above) | never — it's required by the steady-state model |
+| Code | `processing.moving_average` (display + detect) | `fieldtest.aggregate_for_inversion` |
+
+Two things follow, and they're the heart of the "averaging reframe":
+
+1. **The inversion does not pre-smooth for noise.** A weighted least-squares fit over
+   the raw samples already does the √N reduction *optimally* (it's the maximum-likelihood
+   estimate under Gaussian noise). Smoothing first is redundant at best and distorts the
+   noise model at worst. So `aggregate_for_inversion` takes the **time-mean of the
+   *unsmoothed* excess** (`raw − baseline`) over a meander window, and reports the σ **of
+   that mean** (via `effective_noise_floor`, with `n_avg` = window length) as the weight.
+2. **Bias is removed by zeroing, never by averaging.** `aggregate_for_inversion` always
+   returns both framings: subtract the baseline as the zero (`mean_excess_ppm`), or fit
+   background as a free parameter (`mean_raw_ppm` + `baseline_ppm`). The caller chooses.
+
+The LOD "averaging curve" in §4a is therefore the *theoretical noise-only* floor — what
+the random part *could* reach — not a recipe the inversion follows.
+
+---
+
 ## 1. CHARACTERIZE — measure the real noise (`estimate_noise_floor`)
 
 Instead of trusting the assumed `SENSOR_NOISE_PPM = 0.30` placeholder, we measure

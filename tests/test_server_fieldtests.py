@@ -14,6 +14,16 @@ pytest.importorskip("flask")
 from physics import fieldtest
 
 
+@pytest.fixture(autouse=True)
+def _offline_weather(monkeypatch):
+    """Own our hermeticity instead of leaning on the upload's test_date gate: stub
+    the Open-Meteo seam so no upload can reach the network, even one that supplies a
+    resolvable site + test_date. Returning None exercises the offline-fallback path
+    (hand-entered/blank wind is left untouched)."""
+    from physics import weather
+    monkeypatch.setattr(weather, "wind_for_site_date", lambda *a, **k: None)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.delenv("DATABASE_URL", raising=False)

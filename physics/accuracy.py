@@ -17,6 +17,11 @@ in order (the Accuracy Protocol):
   3. BOUND      — the best we can do: the smallest leak detectable now (LOD/LOQ +
      a minimum detectable Q with a wind/stability error bar), AND the theoretical
      best-possible precision of a source fix (the Cramér-Rao bound).
+     NOTE: the LOD's averaging curve is the THEORETICAL *noise-only* floor (how low
+     could the random part go if you averaged N samples — it is bias-limited and
+     flattens once bias dominates). The Week-3 inversion does NOT pre-average to
+     reach it; a weighted least-squares fit averages optimally on its own. See
+     ACCURACY.md "two averaging roles" and fieldtest.aggregate_for_inversion.
   4. GRADE      — fold it all into one 0-100 score, a letter, and the single most
      useful next action.
 

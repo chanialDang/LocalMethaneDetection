@@ -117,6 +117,12 @@ def effective_noise_floor(
     calibration RMSE by √N — only the random part earns that.) With the defaults
     (bias 0, n_avg 1) it returns ``random_ppm`` unchanged, so existing behaviour
     is preserved.
+
+    Two distinct callers, one formula: (a) the *theoretical* detection-limit story
+    in feasibility/accuracy (how low could the floor go if you averaged?), and
+    (b) ``fieldtest.aggregate_for_inversion`` — the σ OF THE MEAN that weights one
+    sensor's averaged reading in the Week-3 inversion. Both are the same quadrature;
+    note neither is "pre-smooth then fit" — see ACCURACY.md "two averaging roles".
     """
     if n_avg < 1:
         raise ValueError(f"n_avg must be ≥ 1, got {n_avg}")

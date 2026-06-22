@@ -45,6 +45,15 @@ def moving_average(signal: np.ndarray, window: int) -> np.ndarray:
     readings makes the noise partly cancel while a real, steady signal survives.
     Averaging N points shrinks the noise by about √N.
 
+    SCOPE (important): this is for DISPLAY and for the detect/explain pipeline — a
+    nicer-looking trace and a stabler detection statistic. It is a *noise* smoother;
+    it does NOT remove bias/drift (use subtract_baseline for that), and the Week-3
+    inversion deliberately does NOT pre-smooth with it — a weighted least-squares
+    fit averages optimally by itself, so smoothing first would only distort the
+    noise model. The averaging the inversion DOES need (a time-mean over a
+    meteorological "meander" window, to match the steady-state plume) lives in
+    fieldtest.aggregate_for_inversion. See ACCURACY.md "two averaging roles".
+
     Edges are handled honestly: near the start/end, where a full window isn't
     available, we average over however many points DO exist (so the output is the
     same length as the input and is not biased toward zero at the ends).

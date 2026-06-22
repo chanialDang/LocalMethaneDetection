@@ -142,6 +142,67 @@ def test_interpret_falls_back_to_template_without_key(monkeypatch):
     assert isinstance(text, str) and len(text) > 120
 
 
+# ─── aggregate_for_inversion (averaging reframe) ─────────────────────────────────
+def test_aggregate_returns_weighted_mean_over_event():
+    sample = fieldtest.make_sample_readings(n=600, event_ppm=4.0, seed=0)
+    res = fieldtest.process_fieldtest(
+        sample["ppm"], temperature=sample["temperature"],
+        humidity=sample["humidity"], time=sample["time"], noise_ppm=0.30,
+    )
+    pt = fieldtest.aggregate_for_inversion(res)
+    assert pt.detected is True
+    # Window is the detected event, and the mean excess is a real positive signal.
+    assert pt.n_window > 1
+    assert pt.window[1] > pt.window[0]
+    assert pt.mean_excess_ppm > 1.0
+    # σ of the mean must be below the single-sample floor (random part averaged down),
+    # and never below the non-averageable bias.
+    assert pt.bias_ppm <= pt.sigma_ppm < pt.random_ppm + pt.bias_ppm + 1e-9
+
+
+def test_aggregate_sigma_shrinks_with_window():
+    # A longer averaging window lowers the random part → smaller σ of the mean
+    # (until bias dominates). Build a long quiet+event record and compare windows.
+    sample = fieldtest.make_sample_readings(n=1200, event_ppm=4.0, seed=1)
+    res = fieldtest.process_fieldtest(
+        sample["ppm"], temperature=sample["temperature"],
+        humidity=sample["humidity"], time=sample["time"], noise_ppm=0.30,
+    )
+    short = fieldtest.aggregate_for_inversion(res, window_s=10)
+    longw = fieldtest.aggregate_for_inversion(res, window_s=200)
+    # detection short-circuits the window when an event is found, so compare on a
+    # flat record where no event exists (window_s actually drives n_window).
+    flat = 1.9 + np.random.default_rng(2).normal(0, 0.3, size=1200)
+    fres = fieldtest.process_fieldtest(flat, noise_ppm=0.30)
+    s = fieldtest.aggregate_for_inversion(fres, window_s=10)
+    l = fieldtest.aggregate_for_inversion(fres, window_s=400)
+    assert l.n_window > s.n_window
+    assert l.sigma_ppm <= s.sigma_ppm
+
+
+def test_aggregate_quiet_record_is_a_null_constraint():
+    flat = 1.9 + np.random.default_rng(3).normal(0, 0.3, size=400)
+    res = fieldtest.process_fieldtest(flat, noise_ppm=0.30)
+    pt = fieldtest.aggregate_for_inversion(res)
+    assert pt.detected is False
+    assert abs(pt.mean_excess_ppm) < 0.3        # "saw nothing" ≈ zero excess
+    assert pt.n_window == 400                    # whole record when no event/window
+
+
+def test_aggregate_exposes_both_bias_framings():
+    sample = fieldtest.make_sample_readings(n=600, event_ppm=4.0, seed=0)
+    res = fieldtest.process_fieldtest(
+        sample["ppm"], temperature=sample["temperature"],
+        humidity=sample["humidity"], time=sample["time"], noise_ppm=0.30,
+    )
+    pt = fieldtest.aggregate_for_inversion(res)
+    # Both framings always available: subtract baseline (mean_excess) OR fit it
+    # (mean_raw + baseline). Raw-frame identity ties them together.
+    assert pt.mean_raw_ppm == pytest.approx(pt.baseline_ppm + pt.mean_excess_ppm,
+                                            abs=1e-6)
+    assert pt.baseline_ppm > 1.0                 # background sits near 1.9 ppm
+
+
 # ─── sample round-trip ──────────────────────────────────────────────────────────
 def test_sample_to_csv_and_back():
     sample = fieldtest.make_sample_readings(n=120, seed=3)

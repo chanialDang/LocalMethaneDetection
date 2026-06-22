@@ -188,6 +188,16 @@ U_MIN         = 0.5     # m/s — minimum valid wind speed
                          # piles up and diffuses in all directions instead).
                          # Below 0.5 m/s we refuse to calculate.
 
+# ── Deployment geometry — measure these on site before a real run ─────────────
+RELEASE_HEIGHT_M = 1.0  # m — H, height the methane leaves the source (near-ground).
+SENSOR_HEIGHT_M  = 1.0  # m — z, height the sensor is mounted on the fence.
+                         # ASSUMED ~1 m. Set the real fence-mounted height (~1–1.5 m)
+                         # HERE once before a Custer/Melissa run — feasibility and
+                         # inversion both read these, so the whole deployment shares
+                         # one geometry. (predict_ppm's own z default stays 0.0 = the
+                         # textbook ground-level reference the contour is drawn at; the
+                         # detection verdict + inversion use SENSOR_HEIGHT_M.)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # DISPERSION COEFFICIENTS  σ_y and σ_z
@@ -674,3 +684,85 @@ def predict_ppm(
     result[down] = np.where(in_range, ppm_down, CH4_BACKGROUND)
 
     return result
+
+
+def predict_excess_grid(
+    source_grid: np.ndarray,
+    receptors: np.ndarray,
+    Q: float,
+    u: float,
+    wind_dir_deg: float,
+    H: float,
+    stability_class: int,
+    T_K: float = 293.15,
+    P_Pa: float = 101325.0,
+    z: float = 0.0,
+) -> np.ndarray:
+    """
+    Excess CH4 (ppm ABOVE background) at each receptor for EACH of many candidate
+    sources — vectorized over the source axis. Returns shape (K, N): K sources × N
+    receptors.
+
+    Why this exists: ``predict_ppm`` is "one source → many receptors". The Week-3
+    source inversion needs the opposite shape — "many trial sources → the same fixed
+    sensors" — evaluated in ONE numpy pass, because looping ``predict_ppm`` once per
+    candidate position is the inversion's dominant cost (a ~50 µs fixed setup paid per
+    candidate over only a handful of receptors). This kernel pays that setup once for
+    the whole grid.
+
+    It reuses the SAME σ table, ``_plume_shape`` and unit conversion as
+    ``predict_ppm``, with predict_ppm's ``clamp_to_table=True`` geometry semantics:
+      • upwind (x_wind ≤ 0)   → 0 excess
+      • downwind, ≤ 200 m     → the Gaussian plume excess
+      • downwind, > 200 m     → 0 excess (source too far to register here)
+      • 0 < x_wind < 1 m     → clamped up to the 1 m table floor
+    so it agrees with ``predict_ppm(src, …, clamp_to_table=True) − CH4_BACKGROUND``
+    receptor-by-receptor (pinned by test_predict_excess_grid_matches_predict_ppm).
+    Background is NOT added — the inversion fits excess, and adding/subtracting a
+    constant on a (K, N) grid would be wasted work.
+
+    Parameters
+    ----------
+    source_grid : (K, 2) candidate source positions [x_east, y_north] (m).
+    receptors   : (N, 2) sensor positions (m).
+    Q, u, …     : as in predict_ppm. u must be ≥ U_MIN.
+
+    Returns
+    -------
+    np.ndarray of shape (K, N) — excess ppm above background.
+    """
+    if not (isinstance(stability_class, (int, np.integer)) and 1 <= stability_class <= 6):
+        raise ValueError(
+            f"stability_class must be an integer 1–6 (1=A … 6=F), got {stability_class!r}."
+        )
+    if u < U_MIN:
+        raise ValueError(
+            f"Wind speed u={u} m/s is below the model minimum ({U_MIN} m/s). "
+            "Concentration diverges as u→0; use a puff model for calm conditions."
+        )
+
+    G = np.atleast_2d(np.asarray(source_grid, dtype=float))   # (K, 2)
+    R = np.atleast_2d(np.asarray(receptors, dtype=float))      # (N, 2)
+
+    # Source→receptor displacement, (K, N): receptor minus each candidate source.
+    phi = math.radians(wind_dir_deg)
+    sin_p, cos_p = math.sin(phi), math.cos(phi)
+    dx = R[:, 0][None, :] - G[:, 0][:, None]
+    dy = R[:, 1][None, :] - G[:, 1][:, None]
+    xw = dx * (-sin_p) + dy * (-cos_p)     # downwind component (+ = downwind)
+    yw = dx * ( cos_p) + dy * (-sin_p)     # crosswind component
+
+    _load_sigma_table()
+    dist = _SIGMA_DIST
+    d_min, d_max = dist[0], dist[-1]
+    eps = 1e-6
+    valid = (xw > 0.0) & (xw <= d_max + eps)   # downwind AND within table reach
+    xc = np.clip(xw, d_min, d_max)             # <1 m clamps up to the 1 m floor
+
+    ci = stability_class - 1
+    sy = np.interp(xc.ravel(), dist, _SIGMA_COLS["sigma_y"][:, ci]).reshape(xc.shape)
+    sz = np.interp(xc.ravel(), dist, _SIGMA_COLS["sigma_z"][:, ci]).reshape(xc.shape)
+
+    C = Q / (2.0 * math.pi * sy * sz * u) * _plume_shape(yw, H, sy, sz, z)
+    excess = C * (R_GAS * T_K) / (M_CH4 * P_Pa) * 1.0e6
+    return np.where(valid, excess, 0.0)

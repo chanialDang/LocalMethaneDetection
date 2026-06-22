@@ -26,7 +26,7 @@ worst case, not just the stronger Custer signal.
 
 ## Current status (Week 2 — validated green)
 
-- `python3 -m pytest tests/ -v` → **115/115 PASS**. `python3 -m misc.demo` now runs validation,
+- `python3 -m pytest tests/ -v` → **148/148 PASS**. `python3 -m misc.demo` now runs validation,
   saves `plume_contour.png`, then **serves the interactive web dashboard** at
   `http://127.0.0.1:5050` and opens the browser (Ctrl+C to stop). For a non-blocking,
   exit-0 run (tests/CI) use **`MPLBACKEND=Agg python3 -m misc.demo --check`** — it validates +
@@ -122,7 +122,9 @@ LocalMethaneDetection/
 │   ├── processing.py              #   Signal cleaning: baseline, averaging, T-H, detection
 │   ├── feasibility.py             #   Forward-model sweep + detectability verdict
 │   ├── accuracy.py                #   Accuracy framework: self-measured noise, recovery, LOD/Q, CRB, grade
-│   ├── fieldtest.py               #   REAL readings: CSV parse + cleaning pipeline + sample gen
+│   ├── fieldtest.py               #   REAL readings: CSV parse + clean + sample gen + aggregate_for_inversion
+│   ├── weather.py                 #   Real wind + Pasquill stability from Open-Meteo archive (offline-safe)
+│   ├── inversion.py               #   Week-3 source inversion: readings → (x, y, Q); scipy-free WLS + CRB
 │   ├── generate_sigma_table.py    #   Regenerates the σ table from Briggs (1973) formulas
 │   └── briggs_dispersion_sigma.csv#   Briggs σ lookup table (1–200 m, 6 classes A–F)
 ├── ui/                            # ── explanation + dashboard front-end ────────
@@ -150,6 +152,9 @@ LocalMethaneDetection/
 ├── tests/test_fieldtest.py        # Pytest — CSV parse + cleaning pipeline + interpret
 ├── tests/test_server_fieldtests.py# Pytest — field-test API (upload/detail/compare/degrade)
 ├── tests/test_accuracy.py         # Pytest — accuracy framework (noise/recovery/LOD/CRB/grade)
+├── tests/test_weather.py          # Pytest — Open-Meteo wind/Pasquill (fixture-based, offline)
+├── tests/test_inversion.py        # Pytest — source inversion: recovery, linear-Q closed form, CRB compare
+├── tests/fixtures/openmeteo_archive.json # Committed Open-Meteo response for hermetic weather tests
 ├── conftest.py                    # Pytest config — puts the project root on sys.path
 ├── samples/custer_sample.csv      # Example readings CSV (from sensor_sim) — try the upload flow
 ├── plume_contour.png              # Static figure from demo.py (with caption box)
@@ -211,6 +216,8 @@ y_wind = dx·(cos φ)  + dy·(−sin φ)    # crosswind
 | `M_CH4` | 16.04 | g/mol | IUPAC 2021 | `plume.py` |
 | `CH4_BACKGROUND` | 1.9 | ppm | NOAA GML 2023 | `plume.py`, `sensor_sim.py` |
 | `U_MIN` | 0.5 | m/s | Model undefined below this | `plume.py` |
+| `RELEASE_HEIGHT_M` | 1.0 | m | **ASSUMED** ~1 m — H; set measured value before a real run | `plume.py` |
+| `SENSOR_HEIGHT_M` | 1.0 | m | **ASSUMED** ~1 m — z (fence mount); `feasibility` + `inversion` read it | `plume.py` |
 | `SENSOR_NOISE_PPM` | 0.30 | ppm (1σ) | **ASSUMED** — RANDOM jitter; averages down as √N | `sensor_sim.py` |
 | `BIAS_FLOOR_PPM` | 0.00 | ppm (1σ) | **ASSUMED** — non-averageable bias/drift; `effective_noise_floor` combines it with the random part in quadrature | `sensor_sim.py` |
 | `DETECT_K` | 3.0 | sigmas | Detection threshold (k·noise_std) | `sensor_sim.py` (imported by `feasibility.py`, `explain.py`) |
@@ -508,7 +515,7 @@ helpers + chat widget under `window.CH4`.
 
 **Run the tests:**
 ```bash
-pytest tests/ -v        # 115 tests
+pytest tests/ -v        # 148 tests
 ```
 `test_processing.py` (Tests 1–5) validates baseline subtraction, noise averaging,
 temperature/humidity correction, pattern detection, and the full pipeline end-to-end.
@@ -523,7 +530,14 @@ and the template interpretation. `test_server_fieldtests.py` pins the field-test
 `test_accuracy.py` pins the accuracy framework (self-measured noise recovers the injected
 0.30 ppm, recovery metrics on a known event, the LOD→min-detectable-Q back-solve, the
 averaging crossover, clean-vs-noisy grading, and the Cramér-Rao bound's monotonicity + σ
-scaling). All new tests run on SQLite with no network.
+scaling). `test_weather.py` pins the Open-Meteo layer (archive parse from a committed fixture,
+Pasquill day/night cases, log-law height adjustment, offline fallback). `test_fieldtest.py`
+also pins `aggregate_for_inversion` (event-window mean + σ-of-the-mean weight, σ shrinking with
+window, the quiet "saw-nothing" null constraint, and the fit-background raw/baseline exposure).
+`test_inversion.py` pins the source inversion (recovers a known (x, y, Q) from synthetic
+multi-sensor readings, the closed-form linear-in-Q amplitude, stability-class selection, the
+weak-signal "unconstrained" guard, and the CRB comparison).
+All new tests run on SQLite with no network.
 
 **Optional: AI-enriched captions + chat (requires a valid OpenAI key):**
 ```bash
@@ -573,6 +587,44 @@ template and the chat returns a clear, human-readable reason — the dashboard n
 
 ---
 
+## Week-3 prep: averaging reframe + real wind (Open-Meteo)
+
+Two fixes that make the upcoming inversion *well-posed* before the optimizer is written.
+They are independent problems but **compose**: 2 sensors at different downwind distances
+make the ratio `C₁/C₂` independent of Q (it constrains position + stability); a known wind
+then turns the absolute level into Q. Together they collapse the **163× Q-uncertainty
+swing** (the spread `implied_Q_range` reports when wind/stability are unknown).
+
+**Problem 1 — averaging reframe.** "Averaging" was doing two unrelated jobs; they are now
+separated (full table in `ACCURACY.md` → "Two averaging roles"):
+- *Noise √N* (`processing.moving_average`) — bias-limited and for **display/detection only**.
+  The inversion does NOT pre-smooth: a weighted least-squares fit already averages optimally.
+- *Meander time-mean* (`fieldtest.aggregate_for_inversion`) — required by the steady-state
+  model. It returns, per sensor, the **time-mean of the *unsmoothed* excess** over an event/
+  meander window plus the **σ of that mean** (`effective_noise_floor` with `n_avg`=window) as
+  the WLS weight — i.e. an `InversionPoint(mean_excess_ppm, sigma_ppm, …)`. Bias never averages
+  away, so both framings are always returned: subtract the baseline as a known zero
+  (`mean_excess_ppm`), or fit background as a free parameter (`mean_raw_ppm`+`baseline_ppm`). A
+  quiet record yields a legitimate "saw-nothing" null constraint, not an error.
+
+**Problem 2 — real wind (`physics/weather.py`).** Replaces the hardcoded `u`/stability guess
+with the wind that was actually blowing, from the **Open-Meteo historical archive** (free, no
+API key, stdlib `urllib` — no new dependency):
+- `fetch_wind_archive(lat, lon, start, end)` is the ONLY networked call; `parse_archive`,
+  `summarize_archive`, `pasquill_class`, `adjust_wind_to_height` are pure and fixture-tested.
+- Derives a **Pasquill class** from sun/cloud/wind (⚠ cutoffs are the standard scheme but must
+  be **verified against a cited reference** — coded as named constants, treated as a first guess),
+  and **log-law-adjusts** the 10 m archive wind toward the ~2 m release height (using 10 m raw
+  would overstate u and understate Q).
+- **Offline-safe** like the OpenAI path: failures return None and set `weather.LAST_WEATHER_ERROR`.
+- Wired into `misc/server.py` upload (`_enrich_meta_with_weather`): when wind isn't hand-entered,
+  the `site` resolves (Custer/Melissa in `weather.SITES`), and a `test_date` is present, it
+  auto-fills `wind_speed`/`wind_dir_deg`/`stability_class`. The `test_date` gate keeps tests
+  network-free.
+
+Out of scope here (still Week 3): the `scipy.optimize` inversion itself. This only makes its
+two inputs — clean aggregated readings and real wind — correct.
+
 ## Project roadmap
 
 **Week 2 (complete):** Forward model + simulation + processing toolkit
@@ -583,11 +635,17 @@ template and the chat returns a clear, human-readable reason — the dashboard n
 - Feasibility assessment (`feasibility.py`): sweep forward model, classify detectable/marginal/undetectable.
 - Visualization (`explain.py`, `demo.py`): contour plot with detection-limit line and plain-English caption.
 
-**Week 3 (next):** Inversion — given sensor readings, find the source
-- Use the forward model as an objective function in `scipy.optimize`.
-- Accept real (noisy) sensor readings or synthetic test data.
-- Return estimated source position (x, y) and emission rate Q.
-- Quantify uncertainty in the estimate.
+**Week 3 (built — `physics/inversion.py`; pending real-data validation):** Inversion — given sensor readings, find the source
+- *Inputs prepped* (see "Week-3 prep" above): `fieldtest.aggregate_for_inversion` yields
+  per-sensor weighted means + σ; `physics/weather.py` supplies real wind + stability.
+- `invert(...)` / `invert_field_tests(...)` recover source (x, y) + emission rate Q by
+  weighted least squares — **scipy-free, by design**: the plume is linear in Q, so Q has a
+  closed form at every trial (x, y) and only a 2-D position search remains (shrinking-grid,
+  multi-start). Stability class is fit by trying all six and keeping the best.
+- Accepts real (noisy) readings or synthetic test data; single source only.
+- Reports per-parameter uncertainty by comparing the fit residual scatter to `crb_source_bound`.
+- *Remaining:* validate end-to-end on real Custer readings, then Melissa; wire `invert` into
+  the dashboard/map so a recovered source draws back onto the contour.
 
 **Week 4 (follow-on):** Feasibility sweep across all scenarios
 - Repeat Week 2 sweep with varied sensor noise, wind, weather, site geometry.

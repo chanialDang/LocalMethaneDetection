@@ -36,7 +36,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from physics.plume import CH4_BACKGROUND, predict_ppm
+from physics.plume import (
+    CH4_BACKGROUND, RELEASE_HEIGHT_M, SENSOR_HEIGHT_M, predict_ppm,
+)
 from physics.sensor_sim import (
     SENSOR_NOISE_PPM, DETECT_K, BIAS_FLOOR_PPM, effective_noise_floor,
 )
@@ -59,8 +61,8 @@ def _excess_at(
     u: float,
     stability: int,
     wind_dir_deg: float = 270.0,
-    H: float = 1.0,
-    z: float = 1.0,
+    H: float = RELEASE_HEIGHT_M,
+    z: float = SENSOR_HEIGHT_M,
     clamp: bool = False,
 ) -> float:
     """Plume excess (ppm above background) at one centreline-downwind receptor.
@@ -104,8 +106,8 @@ def sweep(
     stability_list,
     u: float = 2.0,
     wind_dir_deg: float = 270.0,
-    H: float = 1.0,
-    z: float = 1.0,
+    H: float = RELEASE_HEIGHT_M,
+    z: float = SENSOR_HEIGHT_M,
     noise_floor: float = SENSOR_NOISE_PPM,
     k: float = DEFAULT_K,
 ) -> list[SweepCell]:
@@ -192,8 +194,8 @@ def implied_Q_range(
     u_list=SENSITIVITY_U_RANGE,
     stability_list=SENSITIVITY_STABILITY,
     wind_dir_deg: float = 270.0,
-    H: float = 1.0,
-    z: float = 1.0,
+    H: float = RELEASE_HEIGHT_M,
+    z: float = SENSOR_HEIGHT_M,
 ) -> QRange:
     """
     Given ONE observed excess-ppm reading at a downwind ``distance``, report the

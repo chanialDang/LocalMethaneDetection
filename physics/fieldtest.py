@@ -30,9 +30,11 @@ from __future__ import annotations
 
 import csv
 import io
+from dataclasses import dataclass
 
 import numpy as np
 
+from physics.accuracy import estimate_noise_floor
 from physics.processing import (
     detect_pattern,
     moving_average,
@@ -42,6 +44,7 @@ from physics.processing import (
 from physics.sensor_sim import (
     DETECT_K,
     SENSOR_NOISE_PPM,
+    effective_noise_floor,
     make_plume_event,
     synthetic_timeseries,
 )
@@ -251,6 +254,111 @@ def process_fieldtest(
         "noise_ppm": float(noise_ppm),
         "windows": {"baseline": bw, "smooth": sw, "min_run": int(min_run)},
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AGGREGATE FOR INVERSION  — turn one test's time series into one weighted datum
+# ─────────────────────────────────────────────────────────────────────────────
+@dataclass
+class InversionPoint:
+    """
+    One sensor's contribution to the Week-3 inversion: a model-comparable mean
+    plus the σ that weights it. Built so a weighted least-squares fit can do
+    ``residual = (mean_excess_ppm − predict_ppm(...)) / sigma_ppm`` directly.
+    """
+    mean_excess_ppm: float    # time-mean of the UNSMOOTHED excess over the window
+    sigma_ppm: float          # measurement σ of that mean → weight = 1/σ²
+    n_window: int             # samples averaged (the meander window length)
+    window: tuple             # (start_idx, end_idx) used, end exclusive
+    mean_raw_ppm: float       # time-mean of the raw reading (for the fit-bg path)
+    baseline_ppm: float       # baseline level over the window (bias/background proxy)
+    random_ppm: float         # averageable noise component (1/√N)
+    bias_ppm: float           # non-averageable component (survives averaging)
+    detected: bool            # did this sensor see a sustained event?
+
+
+def _window_from_seconds(time, window_s):
+    """Central index window spanning ``window_s`` seconds; whole record if None."""
+    n = len(time)
+    if window_s is None or n < 2:
+        return 0, n
+    dt = float(np.median(np.diff(time)))
+    if dt <= 0:
+        return 0, n
+    half = int(round((window_s / dt) / 2))
+    mid = n // 2
+    return max(0, mid - half), min(n, mid + half + 1)
+
+
+def aggregate_for_inversion(result: dict, window_s: float | None = None) -> InversionPoint:
+    """
+    Reduce ONE field-test result to one weighted datum for the inversion.
+
+    Call this ONCE per sensor to build its InversionPoint *before* the
+    ``scipy.optimize`` loop; the objective then reads the cached
+    ``mean_excess_ppm``/``sigma_ppm``. Do NOT call it inside the optimizer — it
+    rescans the whole record for the noise floor (``estimate_noise_floor``), which
+    is a property of the sensor record, not of the trial (Q, source pos, stability).
+
+    This is the "averaging done right" half of the reframe. The Gaussian plume is a
+    *time-mean* field, so we hand the optimizer a **time-mean over a meander window**
+    — NOT a noise-smoothed wiggle, and NOT the peak. Critically:
+
+      • The mean is taken over the UNSMOOTHED excess (``raw − baseline``). Pre-smoothing
+        with moving_average is deliberately skipped: a least-squares fit over the
+        window already averages optimally, so smoothing first would only distort the
+        noise model. (See the module + ACCURACY.md "two averaging roles" note.)
+      • ``sigma_ppm`` is the σ OF THE MEAN, combining the averageable random noise
+        (÷√N over the window) with the non-averageable bias, via the shared
+        ``sensor_sim.effective_noise_floor``. That is the correct weight for WLS.
+
+    Bias never averages away, so BOTH framings are always returned and the caller
+    picks: subtract the baseline as a known zero (use ``mean_excess_ppm``), or fit
+    background as a free parameter (use ``mean_raw_ppm`` with ``baseline_ppm`` as the
+    start). They satisfy ``mean_raw_ppm ≈ baseline_ppm + mean_excess_ppm``.
+
+    Window: a detected event's [start, end] when present; else the central
+    ``window_s`` seconds; else the whole record (a legitimate "saw nothing"
+    constraint — a near-zero mean that still bounds the source). Returns an
+    InversionPoint.
+    """
+    time = np.asarray(result["time"], dtype=float)
+    raw = np.asarray(result["raw"], dtype=float)
+    baseline = np.asarray(result["baseline"], dtype=float)
+    det = result["detection"]
+    # Unsmoothed excess in the raw frame: raw − baseline cancels weather + floor and
+    # leaves noise + any plume (the same quantity estimate_noise_floor wants).
+    excess_unsmoothed = raw - baseline
+
+    if det is not None and det.detected and det.start_idx >= 0:
+        lo, hi = det.start_idx, det.end_idx + 1
+    else:
+        lo, hi = _window_from_seconds(time, window_s)
+    lo, hi = int(lo), int(max(lo + 1, hi))
+    n_window = hi - lo
+
+    seg_excess = excess_unsmoothed[lo:hi]
+    mean_excess = float(np.mean(seg_excess))
+    mean_raw = float(np.mean(raw[lo:hi]))
+    baseline_level = float(np.mean(baseline[lo:hi]))
+
+    # Measure the two noise parts from the whole record's quiet samples, then turn
+    # them into the σ of a mean over n_window samples (random shrinks, bias doesn't).
+    ne = estimate_noise_floor(excess_unsmoothed, det)
+    sigma_mean = float(effective_noise_floor(ne.random_ppm, ne.bias_ppm,
+                                             n_avg=max(1, n_window)))
+
+    return InversionPoint(
+        mean_excess_ppm=mean_excess,
+        sigma_ppm=sigma_mean,
+        n_window=n_window,
+        window=(lo, hi),
+        mean_raw_ppm=mean_raw,
+        baseline_ppm=baseline_level,
+        random_ppm=float(ne.random_ppm),
+        bias_ppm=float(ne.bias_ppm),
+        detected=bool(det.detected) if det is not None else False,
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

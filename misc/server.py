@@ -29,7 +29,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 from misc import db
 from ui import explain
-from physics import fieldtest
+from physics import fieldtest, weather
 from ui.explain import (
     DEFAULT_SCENARIO,
     ask_once,
@@ -176,6 +176,33 @@ def _meta_from_form(form) -> dict:
     }
 
 
+def _enrich_meta_with_weather(meta: dict) -> dict | None:
+    """
+    Fill missing wind/stability from the Open-Meteo archive, in place.
+
+    Only attempts a lookup when the domain preconditions hold: the user did NOT
+    already supply wind, the site resolves to known coordinates, and a test_date is
+    present (a historical-archive query is undefined without a date to key it on).
+    All three gates are domain logic; they also happen to keep offline/CI uploads
+    (which omit test_date) network-free, but that is a side effect, not the reason —
+    a test that exercises the lookup should patch the ``weather`` seam directly.
+    Returns the WindEstimate on success (for the response) or None; any failure is
+    silent (leaves the hand-entered/blank values) — the reason is in
+    weather.LAST_WEATHER_ERROR.
+    """
+    if meta.get("wind_speed") is not None or meta.get("stability_class") is not None:
+        return None
+    if not meta.get("test_date") or weather.resolve_site(meta.get("site")) is None:
+        return None
+    est = weather.wind_for_site_date(meta["site"], meta["test_date"])
+    if est is None:
+        return None
+    meta["wind_speed"] = round(est.u, 2)
+    meta["wind_dir_deg"] = round(est.wind_dir_deg, 1)
+    meta["stability_class"] = int(est.stability_class)
+    return est
+
+
 def _store_readings(ft_id: int, parsed: dict) -> None:
     """Persist parsed CSV arrays as raw reading rows."""
     n = parsed["n"]
@@ -320,12 +347,17 @@ def api_fieldtests_create():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    # Auto-fill real wind + stability from Open-Meteo when possible (Problem 2):
+    # collapses the Q-uncertainty swing the inversion otherwise inherits.
+    wx = _enrich_meta_with_weather(meta)
     ft_id = db.create_field_test(meta)
     _store_readings(ft_id, parsed)
     ft = db.get_field_test(ft_id)
     result = _process_stored(ft)
     return jsonify({"id": ft_id, "meta": ft, "facts": summarize_fieldtest(result, ft),
-                    "series": _series_json(result), "columns": parsed["columns"]}), 201
+                    "series": _series_json(result), "columns": parsed["columns"],
+                    "weather": (wx.source if wx else None),
+                    "weather_error": (None if wx else weather.LAST_WEATHER_ERROR)}), 201
 
 
 @app.route("/api/fieldtests/sample", methods=["POST"])
