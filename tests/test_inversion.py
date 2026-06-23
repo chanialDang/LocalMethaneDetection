@@ -25,9 +25,14 @@ SENSORS = np.array([[40.0, 0.0], [70.0, 12.0], [95.0, -18.0], [110.0, 6.0]])
 WIND_U, WIND_DIR, STAB, H, Z = 2.0, 270.0, 4, 1.0, 1.0
 
 
-def _truth_points(true_src, Q_true, sigma=0.1, stability=STAB):
-    """Noiseless InversionPoints for a known source — excess from the forward model."""
-    total = predict_ppm(true_src, Q_true, WIND_U, WIND_DIR, H, stability, SENSORS, z=Z)
+def _truth_points(true_src, Q_true, sigma=0.1, stability=STAB,
+                  sensors=SENSORS, wind_dir=WIND_DIR):
+    """Noiseless InversionPoints for a known source — excess from the forward model.
+
+    ``sensors``/``wind_dir`` default to the shared 270° geometry; the non-cardinal
+    round-trip test overrides them (the defaults keep every other caller unchanged).
+    """
+    total = predict_ppm(true_src, Q_true, WIND_U, wind_dir, H, stability, sensors, z=Z)
     excess = total - CH4_BACKGROUND
     return [
         InversionPoint(
@@ -53,6 +58,31 @@ def test_recovers_known_source_position_and_Q():
     # floor (the downwind axis is a soft direction, so this is the honest bar, not
     # machine-zero — position/Q above are already within tolerance).
     assert est.rmse_ppm < SENSOR_NOISE_PPM
+
+
+# Non-cardinal wind: real Open-Meteo wind blows at arbitrary angles, but every
+# recovery test above uses 270° (where the coordinate rotation is the identity).
+# This drives the whole forward→inverse pipeline at φ=200° and must still localize.
+# A downwind fan to the N/NE (downwind ≈ (0.34, 0.94) at 200°), 50–112 m downwind.
+SENSORS_NC = np.array([[10.0, 50.0], [30.0, 65.0], [20.0, 90.0], [40.0, 105.0]])
+WIND_DIR_NC = 200.0
+
+
+def test_round_trip_recovers_source_off_cardinal():
+    """F1: forward→inverse at a NON-cardinal wind (200°) must recover the source.
+    Catches gross rotation sign/transpose bugs end-to-end. NOTE: forward and inverse
+    share predict_ppm's inline rotation, so this is an INTEGRATION guard — the
+    independent anchors for rotation are the known-answer + non-cardinal equivalence
+    tests in test_plume.py; this confirms the inversion itself works off-cardinal."""
+    true_src, Q_true = (5.0, -3.0), 6.0
+    pts = _truth_points(true_src, Q_true, sensors=SENSORS_NC, wind_dir=WIND_DIR_NC)
+    assert max(p.mean_excess_ppm for p in pts) > 1.0     # non-vacuous: real signal present
+
+    est = inversion.invert(SENSORS_NC, pts, WIND_U, WIND_DIR_NC, stability_class=STAB)
+    assert est.converged is True
+    assert est.x == pytest.approx(true_src[0], abs=3.0)
+    assert est.y == pytest.approx(true_src[1], abs=3.0)
+    assert est.Q == pytest.approx(Q_true, rel=0.05)
 
 
 def test_Q_is_linear_closed_form():

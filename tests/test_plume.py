@@ -185,3 +185,102 @@ def test_vectorized_predict_ppm_matches_scalar_pipeline():
         scalar[i] = gm3_to_ppm_methane(C) + CH4_BACKGROUND
 
     assert np.allclose(vec, scalar, rtol=1e-9, atol=1e-12)
+
+
+# ── rotation: KNOWN ANSWERS at non-cardinal winds (BUGS.md F1) ───────────────
+# Every other rotation test uses wind = 270°, where the rotation collapses to the
+# identity (x_wind = dx, y_wind = dy) — so a sign flip, sin↔cos swap, or x↔y
+# transpose would pass the WHOLE suite, then silently mislocate the source at any
+# real (non-cardinal) wind. These pin rotate_to_wind_frame against the FROM-
+# direction convention worked out BY HAND (independent of the formula): wind φ is
+# where the air comes FROM (clockwise from N), it travels toward φ−180°, the map is
+# x=East / y=North, and +x_wind = downwind.
+
+@pytest.mark.parametrize("phi, x_r, y_r, src, exp_xw, exp_yw, why", [
+    # φ=90°: wind FROM the east → blows WEST. Downwind = −East (no trig needed).
+    (90.0,  -10.0,  0.0, (0.0,  0.0),  10.0,       0.0,      "10 m west = directly downwind"),
+    (90.0,    0.0, 10.0, (0.0,  0.0),   0.0,     -10.0,      "north = pure crosswind"),
+    # φ=180°: wind FROM the south → blows NORTH. Downwind = +North.
+    (180.0,   0.0, 10.0, (0.0,  0.0),  10.0,       0.0,      "10 m north = directly downwind"),
+    (180.0,  10.0,  0.0, (0.0,  0.0),   0.0,     -10.0,      "east = pure crosswind"),
+    # φ=30° (oblique, sin30 ≠ cos30 → catches a sin↔cos swap that 45° would hide).
+    # East receptor : downwind = 10·(−sin30) = −5.0 ; crosswind = 10·cos30 = 8.660254
+    (30.0,   10.0,  0.0, (0.0,  0.0),  -5.0,       8.660254, "x=−10·sin30, y=10·cos30"),
+    # North receptor: downwind = 10·(−cos30) = −8.660254 ; crosswind = 10·(−sin30) = −5.0
+    (30.0,    0.0, 10.0, (0.0,  0.0),  -8.660254, -5.0,      "x=−10·cos30, y=−10·sin30"),
+    # Non-origin source: receptor 10 m west of src at φ=90° → 10 m downwind, 0 cross.
+    (90.0,   -5.0, -3.0, (5.0, -3.0),  10.0,       0.0,      "dx=x_r−src_x=−10 ⇒ downwind 10"),
+])
+def test_rotate_known_answers_off_cardinal(phi, x_r, y_r, src, exp_xw, exp_yw, why):
+    xw, yw = rotate_to_wind_frame(x_r, y_r, src[0], src[1], phi)
+    assert xw == pytest.approx(exp_xw, abs=1e-5), why
+    assert yw == pytest.approx(exp_yw, abs=1e-5), why
+
+
+def test_vectorized_matches_scalar_off_cardinal():
+    """F1: predict_ppm's INLINE rotation must equal rotate_to_wind_frame at a
+    non-cardinal wind (200°), where a rotation bug actually shows. The existing
+    equivalence test only runs at 270° (the identity). With the known-answer test
+    above pinning rotate_to_wind_frame independently, this transitively pins the
+    inline copy used by the vectorized hot path."""
+    rec = np.array([
+        [0.0, 50.0], [20.0, 80.0], [-15.0, 100.0], [10.0, 30.0],
+        [-40.0, 0.0], [0.0, -20.0],     # last two are upwind at 200° → stay background
+    ])
+    src, Q, u, wd, H, sc, z = (0.0, 0.0), 4.0, 3.0, 200.0, 1.0, 4, 1.0
+
+    vec = predict_ppm(src, Q, u, wd, H, sc, rec, z=z)
+
+    scalar = np.full(len(rec), CH4_BACKGROUND, dtype=float)
+    for i, (rx, ry) in enumerate(rec):
+        xw, yw = rotate_to_wind_frame(rx, ry, *src, wd)
+        if xw <= 0.0:
+            continue                                    # upwind → stays at background
+        sy, sz = sigma_y(xw, sc), sigma_z(xw, sc)
+        C = concentration_gm3(xw, yw, Q, u, H, sy, sz, z=z)
+        scalar[i] = gm3_to_ppm_methane(C) + CH4_BACKGROUND
+
+    assert np.allclose(vec, scalar, rtol=1e-9, atol=1e-12)
+    assert np.any(vec > CH4_BACKGROUND)                 # non-vacuous: some are downwind
+
+
+# ── unit conversion: an INDEPENDENT known value (BUGS.md F2) ─────────────────
+def test_gm3_to_ppm_known_value():
+    """Magnitude anchor via the ideal-gas MOLAR VOLUME, not the code's constants.
+    At T=293.15 K, P=101325 Pa:  V_m = R·T/P ≈ 0.024054 m³/mol (≈24 L/mol, the
+    familiar ~20 °C value), and 1 g/m³ CH4 = 1/16.04 = 0.062344 mol/m³, so the
+    mixing ratio ≈ 0.062344 · 0.024054 · 1e6 ≈ 1499.6 ppm. This catches a ×1000
+    (ppb↔ppm), kg↔g, or Pa↔hPa slip — any of which would rescale every recovered Q."""
+    ppm = gm3_to_ppm_methane(1.0)
+    assert ppm == pytest.approx(1499.6, rel=2e-3)        # hand value (see derivation)
+    assert 1000.0 < ppm < 2000.0                         # order-of-magnitude guard
+
+    # Structural guards, independent of the exact constant value:
+    assert gm3_to_ppm_methane(0.0) == 0.0
+    assert gm3_to_ppm_methane(2.0) == pytest.approx(2.0 * ppm, rel=1e-12)            # ∝ C
+    assert gm3_to_ppm_methane(1.0, T_K=2.0 * 293.15) == pytest.approx(2.0 * ppm, rel=1e-12)  # ∝ T
+
+
+# ── normalization: MASS CONSERVATION (BUGS.md F4) ────────────────────────────
+# The conservation law is exactly x- and σ-independent (proof: ∫∫ collapses to Q/u
+# regardless of σ_y, σ_z), so a factor error scales every case identically. The
+# diagonal near→far × unstable→stable spans the full σ range and catches it as
+# surely as the full 3×3 grid would — at 1/3 the (slow) 161×161 integrations.
+@pytest.mark.parametrize("x, cls", [(50.0, 1), (100.0, 4), (150.0, 6)])
+def test_plume_conserves_mass(x, cls):
+    """Independent of the 2π / ×2-reflection normalization factors: numerically
+    integrate the ACTUAL concentration_gm3 over a crosswind×vertical plane and
+    assert the mass flux  u·∫∫C dy dz  recovers Q (the conservation law). It holds
+    for any σ>0 (so the σ-table value is irrelevant) and is independent of x — a
+    factor error in the normalization would keep the plume's shape but break this."""
+    Q, u, H = 1.0, 3.0, 1.0
+    sy, sz = sigma_y(x, cls), sigma_z(x, cls)
+
+    # Integration grid in σ units so it adapts to each (x, class); the integrand is
+    # a smooth Gaussian, so a modest grid converges well past the 5e-3 tolerance.
+    ys = np.linspace(-7.0 * sy, 7.0 * sy, 161)
+    zs = np.linspace(0.0, H + 8.0 * sz, 161)          # ground (z≥0) up the vertical tail
+    C = np.array([[concentration_gm3(x, yy, Q, u, H, sy, sz, z=zz) for zz in zs]
+                  for yy in ys])
+    flux = u * np.trapezoid(np.trapezoid(C, zs, axis=1), ys)
+    assert flux == pytest.approx(Q, rel=5e-3)

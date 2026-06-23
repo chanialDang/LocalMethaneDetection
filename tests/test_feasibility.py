@@ -61,12 +61,6 @@ def test_min_detectable_Q_none_when_nothing_detectable():
     assert min_detectable_Q(cells, 200.0, 6) is None
 
 
-def test_verdict_feasible_quotes_q_min_and_threshold():
-    msg = verdict(sweep([0.05, 0.1, 1.0], [50.0], [4]), 50.0)
-    assert "0.05 g/s" in msg
-    assert "0.90 ppm" in msg                           # threshold = 3 × 0.30
-
-
 def test_verdict_infeasible_when_nothing_detectable():
     msg = verdict(sweep([1e-8], [200.0], [6]), 200.0, stability=6)
     assert "INFEASIBLE" in msg
@@ -134,6 +128,7 @@ def test_verdict_default_keeps_headline_and_adds_upper_bound():
     cells = sweep([round(0.01 * i, 2) for i in range(1, 21)], [50.0], [4])
     msg = verdict(cells, 50.0)
     assert "0.05 g/s" in msg              # the documented headline is preserved …
+    assert "0.90 ppm" in msg              # … quoting the 3 × 0.30 detection threshold …
     assert "upper bound" in msg           # … but now framed honestly as a bound
     assert "field floor" not in msg       # no field line unless asked for
 

@@ -31,16 +31,12 @@ DESIGN NOTES
 
 ⚠ VALIDATION CAVEAT (do not skip)
 ───────────────────────────────────────────────────────────────────────────────
-Checked 2026-06-21. The wind×insolation→class LETTER GRID below is the standard
-Pasquill–Gifford–Turner table (5 wind bands × 3 day insolation levels × 2 night
-cloud classes) — that structure is verified. What is NOT canonical is keying the day
-insolation off measured RADIATION in W/m² (the _INSOL_* cutoffs): the ORIGINAL scheme
-sets strong/moderate/slight by SOLAR ELEVATION ANGLE, whereas the W/m² approach is the
-EPA Solar-Radiation/Delta-T (SRDT) method. So the *method* is legitimate, but the
-specific 700/350 W/m² numbers are an SRDT variant and still need checking against the
-EPA SRDT day table (EPA-454/R-99-005, "Meteorological Monitoring Guidance"; WebMET
-§6.4.2). Treat the auto-class as a good first guess, not an authority — the feasibility
-swing is still reported across neighbouring classes for this reason.
+The Pasquill insolation cutoffs below (radiation/cloud/wind → class) are the
+*standard* Pasquill–Turner scheme, but the exact numeric thresholds vary by
+reference. They are coded here as named constants and must be VERIFIED against a
+cited source (e.g. Turner 1964 / the EPA dispersion workbook) before any result is
+trusted. Treat the auto-class as a good first guess, not an authority — the
+feasibility swing is still reported across neighbouring classes for this reason.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -70,9 +66,7 @@ SITES = {
 }
 
 # ── Pasquill–Turner cutoffs (SEE VALIDATION CAVEAT — verify before trusting) ──
-# Daytime incoming-solar bands (W/m²) — EPA SRDT-style; VERIFY vs EPA-454/R-99-005.
-# (The class LETTER GRID in pasquill_class is the standard table; these W/m² numbers
-#  are the part that varies by reference — the original scheme uses solar angle.)
+# Daytime incoming-solar bands (W/m²): strong / moderate / slight insolation.
 _INSOL_STRONG = 700.0
 _INSOL_MODERATE = 350.0
 _INSOL_SLIGHT = 1.0          # >0 but weak; below this we treat it as night
