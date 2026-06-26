@@ -21,6 +21,7 @@ from physics.plume import (
     CH4_BACKGROUND,
     concentration_gm3,
     gm3_to_ppm_methane,
+    predict_excess_grid,
     predict_ppm,
     rotate_to_wind_frame,
     sigma_y,
@@ -284,3 +285,29 @@ def test_plume_conserves_mass(x, cls):
                   for yy in ys])
     flux = u * np.trapezoid(np.trapezoid(C, zs, axis=1), ys)
     assert flux == pytest.approx(Q, rel=5e-3)
+
+
+def test_predict_excess_grid_matches_predict_ppm():
+    """F3: the batched many-sources kernel must equal the trusted one-source path,
+    receptor by receptor, including the clamp_to_table geometry branches (upwind→0,
+    >200 m→0, <1 m→table floor). predict_ppm is an INDEPENDENT implementation (the
+    source is the outer call, not vectorized over a source axis), so this is a genuine
+    two-implementations-agree check — run off-cardinal (200°) AND at 270° so the
+    rotation identity can't hide a transpose, and over a spread of positions that
+    triggers every clamp branch."""
+    receptors = np.array([[40.0, 0.0], [70.0, 12.0], [95.0, -18.0]])
+    sources = np.array([
+        [5.0, -3.0],      # well downwind, in σ-table range
+        [-40.0, 10.0],    # other side of the sensors
+        [-200.0, 0.0],    # > 200 m downwind at 270° → 0 excess
+        [39.6, 0.2],      # sub-1 m downwind of sensor 0 at 270° → clamp to 1 m floor
+        [10.0, 50.0],     # large crosswind offset
+    ])
+    Q, u, H, z, stab = 5.0, 2.0, 1.0, 1.0, 4
+    for wind in (270.0, 200.0):
+        grid = predict_excess_grid(sources, receptors, Q, u, wind, H, stab, z=z)
+        assert grid.shape == (len(sources), len(receptors))
+        for k, src in enumerate(sources):
+            ref = predict_ppm((float(src[0]), float(src[1])), Q, u, wind, H, stab,
+                              receptors, z=z, clamp_to_table=True) - CH4_BACKGROUND
+            assert np.allclose(grid[k], ref, rtol=1e-9, atol=1e-9)

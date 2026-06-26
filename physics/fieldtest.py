@@ -331,7 +331,7 @@ def aggregate_for_inversion(result: dict, window_s: float | None = None) -> Inve
     excess_unsmoothed = raw - baseline
 
     if det is not None and det.detected and det.start_idx >= 0:
-        lo, hi = det.start_idx, det.end_idx + 1
+        lo, hi = det.start_idx, det.end_idx        # end_idx is exclusive (F5)
     else:
         lo, hi = _window_from_seconds(time, window_s)
     lo, hi = int(lo), int(max(lo + 1, hi))

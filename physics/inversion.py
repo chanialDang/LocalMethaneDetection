@@ -67,10 +67,11 @@ from typing import NamedTuple
 import numpy as np
 
 from physics.plume import (
-    CH4_BACKGROUND, RELEASE_HEIGHT_M, SENSOR_HEIGHT_M, U_MIN, predict_ppm,
+    RELEASE_HEIGHT_M, SENSOR_HEIGHT_M, U_MIN, predict_excess_grid,
 )
 from physics.fieldtest import InversionPoint, aggregate_for_inversion
 from physics.accuracy import crb_source_bound
+from physics.sensor_sim import DETECT_K, effective_noise_floor
 
 
 @dataclass
@@ -99,24 +100,6 @@ class SourceEstimate:
 # ─────────────────────────────────────────────────────────────────────────────
 # Core least-squares pieces (pure, no optimiser dependency)
 # ─────────────────────────────────────────────────────────────────────────────
-def _per_unit_excess(x, y, sensors_xy, u, wind_dir_deg, H, z, stability,
-                     T_K, P_Pa) -> np.ndarray:
-    """
-    Modelled excess (ppm above background) at each sensor for a UNIT 1 g/s source
-    at map position (x, y). Because the plume is linear in Q, scaling this by Q
-    gives the excess for any Q — that linearity is what removes Q from the search.
-
-    Uses ``clamp_to_table=True`` so a trial position that puts a sensor < 1 m or
-    > 200 m downwind never raises (the optimiser must be free to probe anywhere).
-    """
-    total = predict_ppm(
-        src_pos=(float(x), float(y)), Q=1.0, u=u, wind_dir_deg=wind_dir_deg,
-        H=H, stability_class=int(stability), receptors=sensors_xy,
-        T_K=T_K, P_Pa=P_Pa, z=z, clamp_to_table=True,
-    )
-    return total - CH4_BACKGROUND
-
-
 def _solve_Q(g: np.ndarray, d: np.ndarray, w: np.ndarray) -> float:
     """
     Closed-form non-negative weighted-least-squares amplitude.
@@ -143,13 +126,24 @@ class _Cell(NamedTuple):
     resid: np.ndarray
 
 
-def _cost_at(x, y, sensors_xy, d, w, u, wind_dir_deg, H, z, stability, T_K, P_Pa) -> _Cell:
-    """Evaluate one trial (x, y): closed-form Q, then the weighted SSR. Returns a _Cell."""
-    g = _per_unit_excess(x, y, sensors_xy, u, wind_dir_deg, H, z, stability, T_K, P_Pa)
-    Q = _solve_Q(g, d, w)
-    resid = d - Q * g
-    cost = float(np.sum(w * resid * resid))
-    return _Cell(cost, float(x), float(y), Q, resid)
+def _eval_cells(xs, ys, sensors_xy, d, w, u, wind_dir_deg, H, z, stability,
+                T_K, P_Pa) -> list:
+    """Evaluate the whole xs×ys lattice in ONE batched plume pass → list of _Cell.
+
+    predict_excess_grid models "many trial sources → the same sensors" in a single
+    numpy call, so the lattice pays one σ-table/rotation setup instead of one per cell
+    (the inversion's dominant cost). The plume is linear in Q, so each cell's Q is the
+    closed form _solve_Q and its cost is the weighted SSR. Equivalent to looping
+    predict_ppm per cell — pinned by test_predict_excess_grid_matches_predict_ppm."""
+    src_grid = np.array([(float(x), float(y)) for x in xs for y in ys])
+    g_all = predict_excess_grid(src_grid, sensors_xy, 1.0, u, wind_dir_deg, H,
+                                int(stability), T_K=T_K, P_Pa=P_Pa, z=z)
+    cells = []
+    for (x, y), g in zip(src_grid, g_all):
+        Q = _solve_Q(g, d, w)
+        resid = d - Q * g
+        cells.append(_Cell(float(np.sum(w * resid * resid)), float(x), float(y), Q, resid))
+    return cells
 
 
 def _default_bounds(sensors_xy: np.ndarray, pad: float = 150.0) -> tuple:
@@ -165,12 +159,7 @@ def _default_bounds(sensors_xy: np.ndarray, pad: float = 150.0) -> tuple:
             float(ys.min() - pad), float(ys.max() + pad))
 
 
-def _eval_grid(cost_fn, xs, ys) -> list:
-    """Evaluate ``cost_fn`` at every point of the xs×ys lattice → list of _Cell."""
-    return [cost_fn(x, y) for x in xs for y in ys]
-
-
-def _fit_xy(cost_fn, bounds, grid: int, rounds: int, shrink: float,
+def _fit_xy(batch_fn, bounds, grid: int, rounds: int, shrink: float,
             coarse: int, n_seeds: int) -> _Cell:
     """
     Global-ish 2-D minimiser of the cost surface — scipy-free, two stages.
@@ -185,12 +174,12 @@ def _fit_xy(cost_fn, bounds, grid: int, rounds: int, shrink: float,
     short range). A single coarse "best" can sit in a shallow WRONG basin while the
     true deep-but-narrow well is between coarse samples; committing to that one cell
     and shrinking would lock the answer in the wrong place. Keeping several seeds
-    alive lets the fine refine discover the true global minimum. ``cost_fn(x, y)``
-    returns a _Cell; this returns the single best _Cell found.
+    alive lets the fine refine discover the true global minimum. ``batch_fn(xs, ys)``
+    evaluates a whole lattice → list of _Cell; this returns the single best _Cell found.
     """
     x0, x1, y0, y1 = bounds
-    cells = sorted(_eval_grid(cost_fn, np.linspace(x0, x1, coarse),
-                              np.linspace(y0, y1, coarse)), key=lambda c: c.cost)
+    cells = sorted(batch_fn(np.linspace(x0, x1, coarse),
+                            np.linspace(y0, y1, coarse)), key=lambda c: c.cost)
     hw0 = 1.5 * (x1 - x0) / max(coarse - 1, 1)   # seed zoom half-width = 1.5 coarse cells
     hh0 = 1.5 * (y1 - y0) / max(coarse - 1, 1)
 
@@ -198,8 +187,8 @@ def _fit_xy(cost_fn, bounds, grid: int, rounds: int, shrink: float,
     for seed in cells[:max(1, n_seeds)]:
         local, cx, cy, hw, hh = seed, seed.x, seed.y, hw0, hh0
         for _ in range(rounds):
-            cand = min(_eval_grid(cost_fn, np.linspace(cx - hw, cx + hw, grid),
-                                  np.linspace(cy - hh, cy + hh, grid)), key=lambda c: c.cost)
+            cand = min(batch_fn(np.linspace(cx - hw, cx + hw, grid),
+                                np.linspace(cy - hh, cy + hh, grid)), key=lambda c: c.cost)
             if cand.cost < local.cost:
                 local = cand
             cx, cy = local.x, local.y            # re-centre on the current best
@@ -273,13 +262,21 @@ def invert(
 
     # Pull the datum + weight out of each point (InversionPoint or a plain pair).
     def _datum(p):
+        # (mean_excess, σ-of-the-mean, single-sample noise floor). The σ-of-the-mean
+        # is the right WLS weight; the single-sample floor is the right SIGNAL gate.
+        # F6: the σ-of-the-mean shrinks ~√N and the low-percentile baseline leaves a
+        # small positive offset in mean_excess, so gating on 3·σ-of-mean fired on pure
+        # noise ~50% of the time. The per-sample floor is immune to both effects.
         if hasattr(p, "mean_excess_ppm"):
-            return float(p.mean_excess_ppm), float(p.sigma_ppm)
-        return float(p[0]), float(p[1])
+            floor1 = float(effective_noise_floor(p.random_ppm, p.bias_ppm, n_avg=1))
+            floor1 = floor1 if floor1 > 0.0 else float(p.sigma_ppm)
+            return float(p.mean_excess_ppm), float(p.sigma_ppm), floor1
+        return float(p[0]), float(p[1]), float(p[1])     # (mean, σ) tuple: σ is the floor
 
     data = [_datum(p) for p in points]
-    d = np.array([m for m, _ in data])
-    sig = np.array([s for _, s in data])
+    d = np.array([m for m, _, _ in data])
+    sig = np.array([s for _, s, _ in data])
+    floor1 = np.array([f for _, _, f in data])
     sig = np.where(sig > 1e-9, sig, 1e-9)        # guard a zero σ (infinite weight)
     w = 1.0 / (sig * sig)
 
@@ -292,10 +289,10 @@ def invert(
     for trial_cls in classes:
         # Per-class cost closure: binds the fixed geometry/wind so the optimiser only
         # varies (x, y). Short-lived (dropped each iteration), so it pins no big scope.
-        def cost_fn(xx, yy, _cls=trial_cls):
-            return _cost_at(xx, yy, sensors_xy, d, w, u, wind_dir_deg, H, z,
-                            _cls, T_K, P_Pa)
-        cell = _fit_xy(cost_fn, bounds, grid, rounds, shrink, coarse, n_seeds)
+        def batch_fn(xs, ys, _cls=trial_cls):
+            return _eval_cells(xs, ys, sensors_xy, d, w, u, wind_dir_deg, H, z,
+                               _cls, T_K, P_Pa)
+        cell = _fit_xy(batch_fn, bounds, grid, rounds, shrink, coarse, n_seeds)
         if best is None or cell.cost < best.cost:
             best, cls = cell, trial_cls
 
@@ -304,7 +301,10 @@ def invert(
 
     # "Converged" only if there is real signal to localise: some sensor's reading
     # must stand clearly above its own noise AND the fit must explain a positive Q.
-    signal_present = bool(np.any(d > 3.0 * sig))
+    # Real signal = the time-mean excess clears the per-sample detection floor at some
+    # sensor (DETECT_K·single-sample σ — the same threshold feasibility uses), NOT
+    # 3·σ-of-the-mean. See _datum / F6.
+    signal_present = bool(np.any(d > DETECT_K * floor1))
     converged = bool(signal_present and Q > 0.0)
 
     crb_std = None

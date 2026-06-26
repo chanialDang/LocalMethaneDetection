@@ -111,6 +111,21 @@ def test_summarize_empty_raises():
         weather.summarize_archive(empty)
 
 
+def test_summarize_archive_without_direction_does_not_crash():
+    # F9: a degraded archive missing the direction column (parse_archive → None) must
+    # still summarize (default direction 0°), NOT raise on ~np.isnan(None). The
+    # offline-safe contract is "never crash on a degraded archive".
+    no_dir = weather.ArchiveWind(
+        times=["2026-06-10T12:00", "2026-06-10T13:00"],
+        u10=np.array([3.0, 4.0]), direction=None,
+        shortwave=np.array([800.0, 850.0]), cloud=np.array([10.0, 20.0]),
+    )
+    est = weather.summarize_archive(no_dir)
+    assert est.wind_dir_deg == 0.0
+    assert 1 <= est.stability_class <= 6
+    assert est.n_hours == 2
+
+
 # ── site resolution ──────────────────────────────────────────────────────────
 def test_resolve_site_by_name():
     assert weather.resolve_site("Custer Road Transfer Station") == weather.SITES["custer"]

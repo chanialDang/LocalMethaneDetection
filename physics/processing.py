@@ -213,14 +213,22 @@ def temp_humidity_correct(
     if ref_mask is None:
         ref_mask = np.ones_like(signal, dtype=bool)
 
-    # Design matrix [temperature, humidity, 1] for a linear least-squares fit.
-    A_ref = np.column_stack([
-        temperature[ref_mask],
-        humidity[ref_mask],
-        np.ones(np.count_nonzero(ref_mask)),
-    ])
-    coeffs, *_ = np.linalg.lstsq(A_ref, signal[ref_mask], rcond=None)
-    a_temp, b_humid, c_const = coeffs
+    # Drop a weather regressor that doesn't vary across the fit window: a (near-)
+    # constant column is collinear with the intercept, so the lstsq is rank-deficient
+    # and the min-norm split hands it a meaningless coefficient (F10). A non-varying
+    # regressor adds nothing to the VARYING correction, so fit only the columns that
+    # actually move and report a dropped one's coefficient as 0.
+    t_ref, h_ref, s_ref = temperature[ref_mask], humidity[ref_mask], signal[ref_mask]
+
+    def _varies(x):
+        return float(np.ptp(x)) > 1e-9 * (abs(float(np.mean(x))) + 1.0)
+
+    use_t, use_h = _varies(t_ref), _varies(h_ref)
+    cols = ([t_ref] if use_t else []) + ([h_ref] if use_h else []) + [np.ones(s_ref.size)]
+    sol = list(np.linalg.lstsq(np.column_stack(cols), s_ref, rcond=None)[0])
+    a_temp = sol.pop(0) if use_t else 0.0
+    b_humid = sol.pop(0) if use_h else 0.0
+    c_const = sol.pop(0)
 
     # Subtract only the VARYING weather part (keep the constant offset c).
     weather_part = a_temp * temperature + b_humid * humidity

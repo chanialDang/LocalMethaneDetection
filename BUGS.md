@@ -26,7 +26,9 @@ Never delete a finding silently — a closed item is the proof the guard exists.
 ## Section A — Active bugs (✗)
 
 ### F5 — off-by-one in `aggregate_for_inversion` event window
-- [ ] **✗ MED.** `physics/fieldtest.py:333-337` sets `lo, hi = det.start_idx,
+- [x] **✗ → CLOSED (2026-06-25).** Dropped the `+1`; window is now exactly the detected
+  event. Locked by `test_aggregate_window_matches_detected_event_exactly` (window ==
+  `(det.start_idx, det.end_idx)`). Original finding below. `physics/fieldtest.py:333-337` set `lo, hi = det.start_idx,
   det.end_idx + 1`, but `Detection.end_idx` is **already exclusive**
   (`processing.py:243` documents "index just past where it ends"; `detect_pattern`
   computes its own mean with `excess[start_idx:end_idx]`, `processing.py:304`). The
@@ -38,27 +40,36 @@ Never delete a finding silently — a closed item is the proof the guard exists.
   - **Remove:** test that the aggregated window length == the detected event length
     (`hi - lo == det.end_idx - det.start_idx`), then drop the `+1`.
 
-### F6 — overconfident inversion weights (the Melissa low-ppm trap)
-- [ ] **✗ / risk MED.** `physics/fieldtest.py:348-349` builds the σ-of-the-mean
-  with `n_avg = n_window`, i.e. treats every in-window sample as **independent**.
-  Turbulent meander samples are autocorrelated, so the effective N is smaller and
-  `sigma_ppm` is **underestimated**. This couples with `inversion.py:307`
-  (`signal_present = bool(np.any(d > 3.0 * sig))`).
-  - **Impact (inversion):** WLS weights too confident; at very low ppm a pure-noise
-    record can cross `3·sig` and flip the fit to `converged=True`, **fabricating a
-    source** — exactly the worst case for Melissa.
-  - **Trigger:** a quiet multi-sensor record where the per-sensor σ is computed
-    over a long window.
-  - **Remove:** test that a pure-noise multi-sensor record returns
-    `converged=False`; then apply an effective-N / autocorrelation correction to
-    `sigma_ppm` (inflate σ toward the true degrees of freedom).
+### F6 — fabricated source on a no-source record (the Melissa low-ppm trap)
+- [~] **✗ PARTIALLY CLOSED (2026-06-25) — diagnosis corrected by measurement.**
+  Characterized first (per request); the documented cause (autocorrelation →
+  underestimated σ) was NOT the dominant one.
+  - **Dominant cause (FIXED):** the gate `signal_present = np.any(d > 3·sig)` compared
+    `mean_excess` against the σ-OF-THE-MEAN. The baseline (rolling low-percentile floor)
+    biases `mean_excess` POSITIVE (~+0.19 ppm on 0.3-ppm white noise) while the σ-of-the-
+    mean shrinks ~√N — so pure WHITE noise fabricated a source ~50% of the time, even
+    where σ is honest. Fix: gate on the per-sample detection floor
+    `DETECT_K·√(random²+bias²)` (= the feasibility threshold), not the σ-of-the-mean
+    (`inversion.py` `_datum` + gate). White-noise fabrication **54% → 0%**; locked by
+    `test_pure_noise_does_not_fabricate_a_source`.
+  - **Residual (OPEN):** strongly autocorrelated BACKGROUND (ρ≈0.8–0.95) still fabricates
+    ~40% (detect_pattern fires on sustained wander), and `sigma_ppm` stays ~2×
+    overconfident for autocorrelated noise (the `bias_ppm` proxy caps the worst case but
+    not fully), so the CRB is optimistic when a real source IS present. Both need the REAL
+    Figaro noise autocorrelation (CLAUDE.md flags the 0.3-ppm floor as ASSUMED) before an
+    effective-N correction can be tuned to data rather than a guessed AR model.
 
 ---
 
 ## Section B — Correct now but unguarded (⚠ test gaps)
 
 ### F3 — `predict_excess_grid` is unused and its cited test does not exist
-- [ ] **⚠ / efficiency MED-HIGH.** `predict_excess_grid` (`physics/plume.py:689`) was
+- [x] **⚠ → CLOSED (2026-06-25).** Wrote the missing equivalence test
+  `test_predict_excess_grid_matches_predict_ppm` (kernel == `predict_ppm(…,
+  clamp_to_table=True) − CH4_BACKGROUND` per receptor, exercised off-cardinal at 200°
+  and 270°), then wired the kernel into the inversion via `_eval_cells` (one batched
+  plume pass per lattice, replacing the per-cell `predict_ppm`). Full suite **18s → 6s**.
+  Original finding below. `predict_excess_grid` (`physics/plume.py:689`) was
   built explicitly for the inversion grid search, but the inversion loops
   `predict_ppm` instead (`inversion.py:102-117`, `_per_unit_excess`). Its docstring
   cites `test_predict_excess_grid_matches_predict_ppm` (`plume.py:720`), which
@@ -85,21 +96,33 @@ Never delete a finding silently — a closed item is the proof the guard exists.
 ## Section C — Validity & robustness caveats (ℹ)
 
 ### F8 — `pasquill_class` insolation cutoffs unverified
-- [ ] **ℹ.** The day W/m² cutoffs (`physics/weather.py:76-78`, `700/350`) are an EPA
+- [x] **ℹ VERIFIED (2026-06-25) — cutoffs DIVERGE; caveat updated, numeric fix recommended.**
+  Checked against EPA-454/R-99-005 Table 6-7 "Key to the SRDT Method" (p.6-15): EPA daytime
+  bands are **≥925 / 925–675 / 675–175 / <175 W/m²** (4 levels), so the code's `700/350`
+  (3 levels, no `<175→D` band) is biased too UNSTABLE (it calls 700 "strong"; EPA "strong"
+  is ≥925). Daytime WIND bands match EPA; EPA night uses ΔT, code uses cloud (Turner) because
+  Open-Meteo lacks ΔT. `weather.py` caveat now records this with the citation. **Recommended
+  follow-up (user-owned, shifts real-site classes):** set cutoffs to 925/675/175 and add a
+  `<175→D` daytime band. Original note below. The day W/m² cutoffs (`physics/weather.py:76-78`, `700/350`) are an EPA
   SRDT variant, not the original solar-angle scheme — already self-flagged in the
   `weather.py` validation caveat (`weather.py:32-43`). Not a code fix: **verify
   against EPA-454/R-99-005** and cite it. Mitigated because the inversion can try all
   classes and feasibility reports the swing across neighbours.
 
 ### F9 — `summarize_archive` crashes on an archive with no direction column
-- [ ] **ℹ LOW.** `weather.py:228-230` does `archive.direction[~np.isnan(archive.direction)]`;
+- [x] **ℹ LOW → CLOSED (2026-06-25).** Guarded `direction is None` (and all-NaN) → default
+  0°; `test_summarize_archive_without_direction_does_not_crash`. Original finding below.
+  `weather.py:228-230` did `archive.direction[~np.isnan(archive.direction)]`;
   if the column is absent, `parse_archive` returns `None`, so `~np.isnan(None)`
   raises — not caught by the offline-safe path. (In practice the fetch always
   requests direction.) **Remove:** guard `direction is None`; test with a
   direction-less fixture.
 
 ### F10 — `temp_humidity_correct` rank-deficient when temp or humidity is constant
-- [ ] **ℹ LOW.** `processing.py:222` (`np.linalg.lstsq`) is rank-deficient if
+- [x] **ℹ LOW → CLOSED (2026-06-25).** Now drops a (near-)constant regressor before the fit
+  and reports its coefficient as 0; `test_3b_constant_humidity_is_rank_safe` (old min-norm
+  invented a phantom `b_humid=0.058`). Original finding below.
+  `processing.py:222` (`np.linalg.lstsq`) is rank-deficient if
   temperature or humidity is constant/collinear with the intercept; the min-norm
   solution can give meaningless coefficients that corrupt `excess` → `mean_excess` →
   `Q`. `process_fieldtest` only guards "either column varies", not collinearity.

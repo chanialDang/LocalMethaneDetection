@@ -189,6 +189,23 @@ def test_aggregate_quiet_record_is_a_null_constraint():
     assert pt.n_window == 400                    # whole record when no event/window
 
 
+def test_aggregate_window_matches_detected_event_exactly():
+    # F5: the aggregation window must cover EXACTLY the detected event [start, end).
+    # Independent route (not aggregate's own arithmetic): detect_pattern reports the
+    # event bounds, and end_idx is exclusive (processing.py), so the aggregated window
+    # must equal the detected window — no extra sub-threshold sample folded into the mean.
+    sample = fieldtest.make_sample_readings(n=600, event_ppm=4.0, seed=0)
+    res = fieldtest.process_fieldtest(
+        sample["ppm"], temperature=sample["temperature"],
+        humidity=sample["humidity"], time=sample["time"], noise_ppm=0.30,
+    )
+    det = res["detection"]
+    assert det.detected is True
+    pt = fieldtest.aggregate_for_inversion(res)
+    assert pt.window == (det.start_idx, det.end_idx)
+    assert pt.n_window == det.end_idx - det.start_idx
+
+
 def test_aggregate_exposes_both_bias_framings():
     sample = fieldtest.make_sample_readings(n=600, event_ppm=4.0, seed=0)
     res = fieldtest.process_fieldtest(

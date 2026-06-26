@@ -29,14 +29,23 @@ DESIGN NOTES
 • The 10 m archive wind is height-adjusted toward the near-ground release height
   with a log-law profile; using 10 m wind raw would overstate u and so understate Q.
 
-⚠ VALIDATION CAVEAT (do not skip)
+⚠ VALIDATION CAVEAT (do not skip) — F8 VERIFIED 2026-06-25, cutoffs DIVERGE
 ───────────────────────────────────────────────────────────────────────────────
-The Pasquill insolation cutoffs below (radiation/cloud/wind → class) are the
-*standard* Pasquill–Turner scheme, but the exact numeric thresholds vary by
-reference. They are coded here as named constants and must be VERIFIED against a
-cited source (e.g. Turner 1964 / the EPA dispersion workbook) before any result is
-trusted. Treat the auto-class as a good first guess, not an authority — the
-feasibility swing is still reported across neighbouring classes for this reason.
+The daytime W/m² cutoffs below (700/350) do NOT match the cited EPA method. Checked
+against EPA-454/R-99-005 "Meteorological Monitoring Guidance for Regulatory Modeling
+Applications" (Feb 2000), Table 6-7 "Key to the SRDT Method", p.6-15:
+  • EPA daytime solar-radiation bands are ≥925 / 925–675 / 675–175 / <175 W/m² (FOUR
+    levels, incl. a <175→D near-neutral band). This code uses two cutoffs (700/350 →
+    three levels) with no <175→D band, biasing daytime classes too UNSTABLE — it calls
+    700 W/m² "strong", whereas EPA's "strong" is ≥925 (700 is EPA "moderate").
+  • The daytime WIND bands here (<2, 2–3, 3–5, 5–6, ≥6 m/s) DO match EPA Table 6-7.
+  • NIGHT: EPA SRDT keys off the vertical temperature gradient ΔT (<0 vs ≥0), wind
+    bands <2.0 / 2.0–2.5 / ≥2.5 m/s. This code uses CLOUD COVER instead (Turner's cloud
+    method, Table 6-4) because Open-Meteo supplies cloud, not ΔT — a documented deviation.
+Treat the auto-class as a first guess, not an authority. Mitigated downstream: the
+inversion tries all six classes and feasibility reports the swing across neighbours.
+To align daytime with EPA, set the cutoffs to 925/675/175 and add a <175→D band
+(BUGS.md F8) — left as a user-owned change since it shifts the real-site stability class.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -219,9 +228,14 @@ def summarize_archive(archive: ArchiveWind, z_target: float = 2.0,
 
     u10 = float(np.nanmedian(archive.u10))
     u = adjust_wind_to_height(u10, z_target=z_target, z0=z0)
-    direction = _circular_mean_deg(
-        archive.direction[~np.isnan(archive.direction)]
-    )
+    # Direction may be absent (parse_archive returns None when the column is missing)
+    # or all-NaN; default to 0° rather than crashing on ~np.isnan(None) (F9). The
+    # offline-safe contract is "never raise on a degraded archive".
+    if archive.direction is None:
+        direction = 0.0
+    else:
+        valid = archive.direction[~np.isnan(archive.direction)]
+        direction = _circular_mean_deg(valid) if valid.size else 0.0
     rad = float(np.nanmedian(archive.shortwave))
     cloud = float(np.nanmedian(archive.cloud)) if archive.cloud is not None else 0.0
     cls = pasquill_class(u10, rad, cloud)   # class from the 10 m wind (as tabulated)

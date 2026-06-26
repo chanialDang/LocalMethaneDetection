@@ -144,6 +144,30 @@ def test_quiet_record_is_not_converged():
     assert est.crb_std is None          # skipped when there's nothing to localise
 
 
+def test_pure_noise_does_not_fabricate_a_source():
+    # F6: sourceless records (pure background + sensor noise, NO event) must not be
+    # flagged converged. Truth is independent of the inversion — there is no source,
+    # so converged=True is always wrong. The low-percentile baseline leaves a small
+    # POSITIVE offset in mean_excess that the old 3·σ-of-the-mean gate mistook for
+    # signal on ~half of all sourceless multi-sensor records. Gate on the per-sample
+    # detection floor instead, and the rate must stay low.
+    from physics import fieldtest as ft
+    trials, fabricated = 50, 0
+    for seed in range(trials):
+        rng = np.random.default_rng(50_000 + seed)
+        results = [
+            ft.process_fieldtest(CH4_BACKGROUND + rng.normal(0, 0.30, size=400),
+                                 noise_ppm=0.30)
+            for _ in SENSORS
+        ]
+        est = inversion.invert_field_tests(results, SENSORS, WIND_U, WIND_DIR,
+                                           stability_class=STAB)
+        fabricated += int(est.converged)
+    # No source exists → the fabrication rate must stay well under the old ~50%.
+    # A small residual just reflects detect_pattern's own false-positive rate.
+    assert fabricated / trials <= 0.15, f"fabricated {fabricated}/{trials} from noise"
+
+
 def test_calm_wind_raises():
     pts = _truth_points((5.0, 0.0), 6.0)
     with pytest.raises(ValueError):

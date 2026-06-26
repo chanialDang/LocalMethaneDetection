@@ -93,6 +93,25 @@ def test_3_temp_humidity_correction():
     assert abs(coeffs["b_humid"] - b) < 0.01
 
 
+def test_3b_constant_humidity_is_rank_safe():
+    # F10: a constant humidity column is collinear with the intercept, so the old
+    # rank-deficient lstsq handed it a meaningless min-norm coefficient. The dropped
+    # regressor must report 0, the temperature correction must still be exact, and the
+    # varying weather part must be fully removed.
+    n = 400
+    t = np.arange(n)
+    temperature = 20.0 + 3.0 * np.sin(2 * np.pi * t / n)   # varies
+    humidity = np.full(n, 50.0)                            # constant → unidentifiable
+    a, b0, c = 0.05, 0.02, 1.9
+    signal = a * temperature + b0 * humidity + c           # noiseless
+
+    corrected, coeffs = temp_humidity_correct(signal, temperature, humidity)
+
+    assert coeffs["b_humid"] == 0.0            # dropped, not a min-norm artefact
+    assert abs(coeffs["a_temp"] - a) < 1e-6    # temp sensitivity still exact
+    assert corrected.std() < 1e-6              # all the varying part removed
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 4 — Pattern detection: finds a real event, ignores pure noise
 # ─────────────────────────────────────────────────────────────────────────────
