@@ -89,8 +89,9 @@ class SourceEstimate:
     u: float                  # wind speed assumed (m/s)
     wind_dir_deg: float       # wind FROM-direction assumed (° from N)
     cost: float               # weighted SSR at the optimum  Σ wᵢ(dᵢ − Q gᵢ)²
-    rmse_ppm: float           # unweighted RMS residual (ppm) — human-readable fit
-    residuals_ppm: list       # per-sensor (observed − modelled) excess (ppm)
+    rmse_ppm: float           # unweighted RMS residual (ppm), over every snapshot×sensor
+    residuals_ppm: list       # (observed − modelled) excess (ppm), one per snapshot×sensor
+                              #   (= per-sensor when n_snapshots == 1)
     n_sensors: int
     crb_std: dict | None      # CRB best-possible 1σ {"x","y","Q"} (None if skipped)
     converged: bool           # False when the signal is too weak to localise
@@ -393,6 +394,9 @@ def invert_multi(
 
     best, best_snaps = None, None
     for trial in classes:
+        # Each snapshot keeps its OWN class when set, else takes the trial class. ``trial``
+        # is None only when classes==[None], which by need_fit happens only when every
+        # snapshot's class IS set — so the ``else trial`` branch is never taken then.
         resolved = [_Snap(d, w, floor1, u, wd, int(st if st is not None else trial))
                     for (d, w, floor1, u, wd, st) in base]
         # Cost closure binds the resolved snapshots so the optimiser only varies (x, y).
@@ -411,8 +415,7 @@ def invert_multi(
     # the fit must explain a positive Q.
     d_all = np.concatenate([s.d for s in best_snaps])
     floor1_all = np.concatenate([s.floor1 for s in best_snaps])
-    n_signal = int(np.sum(d_all > DETECT_K * floor1_all))
-    converged = bool(n_signal > 0 and Q > 0.0)
+    converged = bool(np.any(d_all > DETECT_K * floor1_all) and Q > 0.0)
     cls = int(best_snaps[0].stability)
 
     crb_std = None
@@ -422,9 +425,10 @@ def invert_multi(
     else:
         if with_crb:
             # Representative iid σ (the CRB assumes equal independent noise): RMS of the
-            # per-sensor σ across all snapshots. Fisher info adds → combined (tighter) bound.
-            sig_all = np.concatenate([1.0 / np.sqrt(s.w) for s in best_snaps])
-            sigma_rep = float(np.sqrt(np.mean(sig_all ** 2)))
+            # per-sensor σ across all snapshots = √(mean(1/w)) since w = 1/σ². Fisher info
+            # adds across snapshots → combined (tighter) bound.
+            w_all = np.concatenate([s.w for s in best_snaps])
+            sigma_rep = float(np.sqrt(np.mean(1.0 / w_all)))
             try:
                 views = [(s.u, s.wind_dir_deg, int(s.stability)) for s in best_snaps]
                 crb = crb_source_bound_multi(src_pos=(x, y), Q=Q, views=views, H=H,

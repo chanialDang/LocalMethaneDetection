@@ -347,6 +347,21 @@ def test_multi_snapshot_tolerates_a_blind_snapshot():
     assert est.converged is True
 
 
+def test_invert_multi_fits_when_each_snapshot_carries_its_own_stability():
+    # stability_class=None AND every snapshot supplies its OWN class → a single pass that
+    # uses each snapshot's class, no class fitting and no crash. Pins the resolution path
+    # (trial is None here) that a reviewer suspected could TypeError — it does not.
+    src, Q, stab = (5.0, -3.0), 6.0, 3
+    snaps = [inversion.Snapshot(_truth_points(src, Q, stability=stab, wind_dir=wd),
+                                WIND_U, wd, stability_class=stab)
+             for wd in (260.0, 280.0)]
+    est = inversion.invert_multi(SENSORS, snaps, stability_class=None)
+    assert est.n_snapshots == 2
+    assert est.stability_class == stab            # used each snapshot's class, didn't refit
+    assert est.x == pytest.approx(src[0], abs=3.0)
+    assert est.Q == pytest.approx(Q, rel=0.1)
+
+
 def test_f7_realistic_dataset_is_well_posed_for_the_fit():
     # Guard the LEVER, not the bug: confirm the hard dataset is genuinely solvable —
     # it carries real signal (so the wrong answer is a localisation failure, not an
