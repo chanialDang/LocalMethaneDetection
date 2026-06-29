@@ -139,6 +139,19 @@ def test_4_pattern_detection_true_and_false():
     assert det_false.detected is False
 
 
+def test_4b_detect_pattern_zero_noise_is_clean():
+    # σ→0 (a noiseless sensor) must NOT divide-by-zero: SNR is infinite, but the code
+    # should return inf confidence cleanly with no RuntimeWarning and no NaN.
+    import warnings
+    excess = np.array([0.0, 0.0, 5.0, 5.0, 5.0, 5.0, 5.0, 0.0])
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")            # any RuntimeWarning → test failure
+        det = detect_pattern(excess, noise_std=0.0, k=3.0, min_run=3)
+    assert det.detected is True
+    assert det.confidence == float("inf")         # infinite SNR, not NaN
+    assert not np.isnan(det.confidence)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 5 — Full pipeline recovers a known plume from messy raw data
 # ─────────────────────────────────────────────────────────────────────────────

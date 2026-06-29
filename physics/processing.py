@@ -309,7 +309,10 @@ def detect_pattern(
     if best_len >= min_run:
         start_idx = best_start
         end_idx = best_start + best_len
-        confidence = float(np.mean(excess[start_idx:end_idx]) / noise_std)
+        seg_mean = float(np.mean(excess[start_idx:end_idx]))
+        # σ→0 is degenerate (a noiseless sensor): SNR is infinite, but divide it
+        # explicitly rather than letting 0-division emit a RuntimeWarning / NaN.
+        confidence = seg_mean / noise_std if noise_std > 0 else float("inf")
         return Detection(True, start_idx, end_idx, confidence, threshold)
 
     return Detection(False, -1, -1, 0.0, threshold)
