@@ -70,7 +70,7 @@ from physics.plume import (
     RELEASE_HEIGHT_M, SENSOR_HEIGHT_M, U_MIN, predict_excess_grid,
 )
 from physics.fieldtest import InversionPoint, aggregate_for_inversion
-from physics.accuracy import crb_source_bound
+from physics.accuracy import crb_source_bound_multi
 from physics.sensor_sim import DETECT_K, effective_noise_floor
 
 
@@ -95,28 +95,31 @@ class SourceEstimate:
     crb_std: dict | None      # CRB best-possible 1σ {"x","y","Q"} (None if skipped)
     converged: bool           # False when the signal is too weak to localise
     note: str                 # short provenance / caveat
+    n_snapshots: int = 1      # how many wind-snapshots were fused (1 = single)
+
+
+@dataclass
+class Snapshot:
+    """
+    One observation of the SAME source + sensors under ONE wind. A multi-hour field
+    deployment yields several of these as the wind veers; fusing them triangulates an
+    otherwise under-determined fenceline (see invert_multi / BUGS.md F7).
+
+    ``points`` are this snapshot's per-sensor readings (InversionPoint objects or
+    (mean_excess_ppm, sigma_ppm) pairs), in the same sensor order as every other
+    snapshot. ``u``/``wind_dir_deg`` are the wind that blew DURING this snapshot.
+    ``stability_class`` is this snapshot's Pasquill class if known (weather.py gives
+    it per time); None lets the fit choose one shared class across snapshots.
+    """
+    points: list
+    u: float
+    wind_dir_deg: float
+    stability_class: int | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Core least-squares pieces (pure, no optimiser dependency)
 # ─────────────────────────────────────────────────────────────────────────────
-def _solve_Q(g: np.ndarray, d: np.ndarray, w: np.ndarray) -> float:
-    """
-    Closed-form non-negative weighted-least-squares amplitude.
-
-    Minimises Σ wᵢ(dᵢ − Q gᵢ)² over the single scalar Q:
-        dCost/dQ = 0  ⇒  Q = Σ wᵢ gᵢ dᵢ / Σ wᵢ gᵢ²
-    then clamp to Q ≥ 0 (a negative emission rate is unphysical). When the modelled
-    shape is ~0 at every sensor (source can't reach them), the denominator is ~0 and
-    we return Q = 0 — i.e. "this position explains nothing", which the cost will then
-    penalise for any real signal.
-    """
-    denom = float(np.sum(w * g * g))
-    if denom <= 1e-30:
-        return 0.0
-    return max(0.0, float(np.sum(w * g * d) / denom))
-
-
 class _Cell(NamedTuple):
     """One evaluated candidate: its weighted cost, position, closed-form Q, residuals."""
     cost: float
@@ -126,24 +129,73 @@ class _Cell(NamedTuple):
     resid: np.ndarray
 
 
-def _eval_cells(xs, ys, sensors_xy, d, w, u, wind_dir_deg, H, z, stability,
-                T_K, P_Pa) -> list:
-    """Evaluate the whole xs×ys lattice in ONE batched plume pass → list of _Cell.
+class _Snap(NamedTuple):
+    """A snapshot prepared for the optimiser: data, weights, and its resolved wind
+    + stability. Same sensors as every other snapshot; only the wind/stability differ."""
+    d: np.ndarray            # per-sensor mean excess (ppm)
+    w: np.ndarray            # per-sensor WLS weight 1/σ²
+    floor1: np.ndarray       # per-sensor single-sample detection floor (ppm)
+    u: float                 # wind speed for this snapshot (m/s)
+    wind_dir_deg: float      # wind FROM-direction for this snapshot (° from N)
+    stability: int           # Pasquill class used for this snapshot (1–6)
 
-    predict_excess_grid models "many trial sources → the same sensors" in a single
-    numpy call, so the lattice pays one σ-table/rotation setup instead of one per cell
-    (the inversion's dominant cost). The plume is linear in Q, so each cell's Q is the
-    closed form _solve_Q and its cost is the weighted SSR. Equivalent to looping
-    predict_ppm per cell — pinned by test_predict_excess_grid_matches_predict_ppm."""
+
+def _prep_points(points, n) -> tuple:
+    """Extract per-sensor (datum, σ-of-mean, single-sample floor) and the WLS weight.
+
+    Accepts InversionPoint objects or plain (mean_excess, σ) pairs. Factored so the
+    single- and multi-snapshot entry points share ONE definition of the datum and the
+    F6 signal gate. ``floor1`` is the single-sample detection floor (NOT the √N-shrunk
+    σ-of-the-mean): the right SIGNAL gate, immune to the baseline offset that made the
+    σ-of-the-mean gate fire on pure noise (see F6)."""
+    if len(points) != n:
+        raise ValueError(f"got {n} sensor positions but {len(points)} readings")
+
+    def datum(p):
+        if hasattr(p, "mean_excess_ppm"):
+            floor1 = float(effective_noise_floor(p.random_ppm, p.bias_ppm, n_avg=1))
+            floor1 = floor1 if floor1 > 0.0 else float(p.sigma_ppm)
+            return float(p.mean_excess_ppm), float(p.sigma_ppm), floor1
+        return float(p[0]), float(p[1]), float(p[1])     # (mean, σ) tuple: σ is the floor
+
+    data = [datum(p) for p in points]
+    d = np.array([m for m, _, _ in data])
+    sig = np.array([s for _, s, _ in data])
+    floor1 = np.array([f for _, _, f in data])
+    sig = np.where(sig > 1e-9, sig, 1e-9)                # guard a zero σ (infinite weight)
+    return d, sig, floor1, 1.0 / (sig * sig)
+
+
+def _eval_cells(xs, ys, sensors_xy, snaps, H, z, T_K, P_Pa) -> list:
+    """Evaluate the whole xs×ys lattice across ALL snapshots in batched plume passes.
+
+    A steady leak of strength Q seen under K winds produces K predicted patterns that
+    SHARE the same Q (the source emits the same g/s whatever the wind). The plume is
+    linear in Q, so the joint best-fit Q at each trial (x, y) stays closed-form, now
+    summed over every snapshot's sensors:
+
+        Q* = Σ_k Σ_i w g d  /  Σ_k Σ_i w g²        (clamped ≥ 0)
+
+    K=1 reduces to the original per-cell WLS amplitude; K≥2 is what makes an
+    under-determined single-wind fenceline identifiable (BUGS.md F7). One
+    predict_excess_grid pass per snapshot pays the σ-table/rotation setup once per
+    lattice (pinned vs predict_ppm by test_predict_excess_grid_matches_predict_ppm)."""
     src_grid = np.array([(float(x), float(y)) for x in xs for y in ys])
-    g_all = predict_excess_grid(src_grid, sensors_xy, 1.0, u, wind_dir_deg, H,
-                                int(stability), T_K=T_K, P_Pa=P_Pa, z=z)
-    cells = []
-    for (x, y), g in zip(src_grid, g_all):
-        Q = _solve_Q(g, d, w)
-        resid = d - Q * g
-        cells.append(_Cell(float(np.sum(w * resid * resid)), float(x), float(y), Q, resid))
-    return cells
+    gs = [predict_excess_grid(src_grid, sensors_xy, 1.0, sn.u, sn.wind_dir_deg, H,
+                              int(sn.stability), T_K=T_K, P_Pa=P_Pa, z=z)
+          for sn in snaps]
+    num = sum(np.sum(sn.w * g * sn.d, axis=1) for sn, g in zip(snaps, gs))
+    den = sum(np.sum(sn.w * g * g, axis=1) for sn, g in zip(snaps, gs))
+    Q = np.zeros(len(src_grid))
+    ok = den > 1e-30                       # ~0 everywhere → source reaches no sensor here
+    Q[ok] = np.maximum(0.0, num[ok] / den[ok])
+    # Weighted residuals + SSR over EVERY snapshot×sensor point (concatenated).
+    resid_all = np.concatenate([sn.d[None, :] - Q[:, None] * g
+                                for sn, g in zip(snaps, gs)], axis=1)    # (K_cells, K·N)
+    w_all = np.concatenate([sn.w for sn in snaps])                        # (K·N,)
+    cost = np.sum(w_all[None, :] * resid_all * resid_all, axis=1)
+    return [_Cell(float(cost[i]), float(src_grid[i, 0]), float(src_grid[i, 1]),
+                  float(Q[i]), resid_all[i]) for i in range(len(src_grid))]
 
 
 def _default_bounds(sensors_xy: np.ndarray, pad: float = 150.0) -> tuple:
@@ -234,6 +286,9 @@ def invert(
                        fit (lets the inversion estimate stability too).
     H, z             : release height and sensor height (m) — fixed geometry.
     bounds           : (x0, x1, y0, y1) search box (m); default = sensors' bbox + 150 m.
+                       Avoid boxes >> the default: when a single near-sensor sees huge
+                       excess, the coarse grid can lock onto a spurious basin with a
+                       huge Q rather than the true source (see BUGS.md F7).
     coarse, grid, rounds, shrink, n_seeds : two-stage optimiser controls (see _fit_xy):
                        ``coarse`` = full-box scan resolution; the best ``n_seeds``
                        basins are each refined with a ``grid``-cell local zoom over
@@ -251,84 +306,139 @@ def invert(
       the module header. That is why this is fast and scipy-free.
     • u must be ≥ U_MIN (0.5 m/s); the steady-state plume is undefined below that.
     """
+    return invert_multi(
+        sensor_positions,
+        [Snapshot(points=points, u=u, wind_dir_deg=wind_dir_deg)],
+        stability_class=stability_class, H=H, z=z, T_K=T_K, P_Pa=P_Pa,
+        bounds=bounds, coarse=coarse, grid=grid, rounds=rounds, shrink=shrink,
+        n_seeds=n_seeds, with_crb=with_crb,
+    )
+
+
+def invert_multi(
+    sensor_positions,
+    snapshots,
+    stability_class: int | None = None,
+    H: float = RELEASE_HEIGHT_M,
+    z: float = SENSOR_HEIGHT_M,
+    T_K: float = 293.15,
+    P_Pa: float = 101325.0,
+    bounds: tuple | None = None,
+    coarse: int = 60,
+    grid: int = 11,
+    rounds: int = 6,
+    shrink: float = 0.5,
+    n_seeds: int = 12,
+    with_crb: bool = True,
+) -> SourceEstimate:
+    """
+    Recover ONE steady source from the SAME sensors observed under several winds.
+
+    This is the cure for the single-wind ill-posedness of BUGS.md F7. A fenceline where
+    only a sensor or two sits in the plume is under-determined from one snapshot — many
+    (x, y, Q) explain the readings equally, and the fit can land tens of metres away
+    while looking confident. Watching the leak from several wind directions TRIANGULATES
+    it: each wind sweeps the plume across a different subset of sensors, and the snapshots
+    only agree at the true source. (Empirically, 2–3 winds collapse a ~28 m single-wind
+    error to sub-metre.)
+
+    The physics stays scipy-free: a steady leak emits the same Q under every wind, so Q
+    is still solved in closed form — now jointly across all snapshots (see _eval_cells) —
+    leaving the same 2-D (x, y) grid search. Fisher information adds across snapshots, so
+    the returned CRB is the combined (tighter) bound (crb_source_bound_multi).
+
+    Parameters
+    ----------
+    sensor_positions : (N, 2) sensor map positions [x_east, y_north] (m) — shared by all
+                       snapshots (the array doesn't move; the wind does).
+    snapshots        : list of Snapshot, one per wind. Each carries its own ``points``
+                       (N readings, same sensor order), ``u``, ``wind_dir_deg`` and
+                       optional ``stability_class``.
+    stability_class  : shared Pasquill class to FIX, or None to fit one shared class. A
+                       snapshot's own ``stability_class`` (if set) overrides this for that
+                       snapshot — pin each from weather.py when you have per-time data.
+    coarse, n_seeds  : denser defaults than ``invert`` (60/12 vs 28/6). Each snapshot you
+                       add SHARPENS the joint cost basin (more constraints → narrower
+                       well), so a coarse grid can step over it; raise ``coarse`` further
+                       if you fuse many snapshots. (other args as in ``invert``.)
+
+    Returns
+    -------
+    SourceEstimate with ``n_snapshots`` set. ``u``/``wind_dir_deg`` report the first
+    snapshot's wind (representative); the full set is summarised in ``note``.
+    """
     sensors_xy = np.atleast_2d(np.asarray(sensor_positions, dtype=float))
     n = sensors_xy.shape[0]
     if n == 0:
         raise ValueError("need at least one sensor position")
-    if len(points) != n:
-        raise ValueError(f"got {n} sensor positions but {len(points)} readings")
-    if u < U_MIN:
-        raise ValueError(f"wind u={u} m/s is below the model minimum {U_MIN} m/s")
+    if not snapshots:
+        raise ValueError("need at least one snapshot")
 
-    # Pull the datum + weight out of each point (InversionPoint or a plain pair).
-    def _datum(p):
-        # (mean_excess, σ-of-the-mean, single-sample noise floor). The σ-of-the-mean
-        # is the right WLS weight; the single-sample floor is the right SIGNAL gate.
-        # F6: the σ-of-the-mean shrinks ~√N and the low-percentile baseline leaves a
-        # small positive offset in mean_excess, so gating on 3·σ-of-mean fired on pure
-        # noise ~50% of the time. The per-sample floor is immune to both effects.
-        if hasattr(p, "mean_excess_ppm"):
-            floor1 = float(effective_noise_floor(p.random_ppm, p.bias_ppm, n_avg=1))
-            floor1 = floor1 if floor1 > 0.0 else float(p.sigma_ppm)
-            return float(p.mean_excess_ppm), float(p.sigma_ppm), floor1
-        return float(p[0]), float(p[1]), float(p[1])     # (mean, σ) tuple: σ is the floor
-
-    data = [_datum(p) for p in points]
-    d = np.array([m for m, _, _ in data])
-    sig = np.array([s for _, s, _ in data])
-    floor1 = np.array([f for _, _, f in data])
-    sig = np.where(sig > 1e-9, sig, 1e-9)        # guard a zero σ (infinite weight)
-    w = 1.0 / (sig * sig)
+    # Prepare every snapshot (datum/weights/floor + its own wind & known stability).
+    base = []
+    for sn in snapshots:
+        if sn.u < U_MIN:
+            raise ValueError(f"wind u={sn.u} m/s is below the model minimum {U_MIN} m/s")
+        d, sig, floor1, w = _prep_points(sn.points, n)
+        base.append((d, w, floor1, float(sn.u), float(sn.wind_dir_deg),
+                     sn.stability_class))
 
     if bounds is None:
         bounds = _default_bounds(sensors_xy)
 
-    classes = [int(stability_class)] if stability_class is not None else [1, 2, 3, 4, 5, 6]
+    # Try all six classes only when at least one snapshot's class is unknown AND no
+    # shared class was fixed; otherwise a single pass (each snapshot keeps its own).
+    need_fit = stability_class is None and any(st is None for *_, st in base)
+    classes = [1, 2, 3, 4, 5, 6] if need_fit else [stability_class]
 
-    best, cls = None, classes[0]     # best _Cell across classes, and the winning class
-    for trial_cls in classes:
-        # Per-class cost closure: binds the fixed geometry/wind so the optimiser only
-        # varies (x, y). Short-lived (dropped each iteration), so it pins no big scope.
-        def batch_fn(xs, ys, _cls=trial_cls):
-            return _eval_cells(xs, ys, sensors_xy, d, w, u, wind_dir_deg, H, z,
-                               _cls, T_K, P_Pa)
+    best, best_snaps = None, None
+    for trial in classes:
+        resolved = [_Snap(d, w, floor1, u, wd, int(st if st is not None else trial))
+                    for (d, w, floor1, u, wd, st) in base]
+        # Cost closure binds the resolved snapshots so the optimiser only varies (x, y).
+        def batch_fn(xs, ys, _snaps=resolved):
+            return _eval_cells(xs, ys, sensors_xy, _snaps, H, z, T_K, P_Pa)
         cell = _fit_xy(batch_fn, bounds, grid, rounds, shrink, coarse, n_seeds)
         if best is None or cell.cost < best.cost:
-            best, cls = cell, trial_cls
+            best, best_snaps = cell, resolved
 
     cost, x, y, Q, resid = best.cost, best.x, best.y, best.Q, best.resid
     rmse = float(np.sqrt(np.mean(resid ** 2)))
+    K = len(best_snaps)
 
-    # "Converged" only if there is real signal to localise: some sensor's reading
-    # must stand clearly above its own noise AND the fit must explain a positive Q.
-    # Real signal = the time-mean excess clears the per-sample detection floor at some
-    # sensor (DETECT_K·single-sample σ — the same threshold feasibility uses), NOT
-    # 3·σ-of-the-mean. See _datum / F6.
-    signal_present = bool(np.any(d > DETECT_K * floor1))
-    converged = bool(signal_present and Q > 0.0)
+    # "Converged" only with real signal to localise: some sensor in some snapshot must
+    # stand clearly above its own per-sample floor (DETECT_K·single-sample σ, F6) AND
+    # the fit must explain a positive Q.
+    d_all = np.concatenate([s.d for s in best_snaps])
+    floor1_all = np.concatenate([s.floor1 for s in best_snaps])
+    n_signal = int(np.sum(d_all > DETECT_K * floor1_all))
+    converged = bool(n_signal > 0 and Q > 0.0)
+    cls = int(best_snaps[0].stability)
 
     crb_std = None
-    note = "shrinking-grid WLS; Q closed-form (linear-in-Q)"
+    note = f"shrinking-grid WLS; Q closed-form (linear-in-Q); {K} snapshot(s)"
     if not converged:
         note = "no sensor shows signal above 3σ — Q≈0, position unconstrained (upper-bound only)"
-    elif with_crb:
-        # Representative iid σ for the CRB (it assumes equal independent noise); use
-        # the RMS of the per-sensor σ. Approximate when σ varies a lot across sensors.
-        sigma_rep = float(np.sqrt(np.mean(sig ** 2)))
-        try:
-            crb = crb_source_bound(
-                src_pos=(x, y), Q=Q, u=u, wind_dir_deg=wind_dir_deg, H=H,
-                stability_class=cls, receptors=sensors_xy, sigma_ppm=sigma_rep)
-            crb_std = crb.std
-            note += f"; CRB at σ≈{sigma_rep:.2f} ppm ({crb.note})"
-        except Exception as exc:                 # never let the referee crash the fit
-            note += f"; CRB unavailable ({type(exc).__name__})"
+    else:
+        if with_crb:
+            # Representative iid σ (the CRB assumes equal independent noise): RMS of the
+            # per-sensor σ across all snapshots. Fisher info adds → combined (tighter) bound.
+            sig_all = np.concatenate([1.0 / np.sqrt(s.w) for s in best_snaps])
+            sigma_rep = float(np.sqrt(np.mean(sig_all ** 2)))
+            try:
+                views = [(s.u, s.wind_dir_deg, int(s.stability)) for s in best_snaps]
+                crb = crb_source_bound_multi(src_pos=(x, y), Q=Q, views=views, H=H,
+                                             receptors=sensors_xy, sigma_ppm=sigma_rep)
+                crb_std = crb.std
+                note += f"; CRB at σ≈{sigma_rep:.2f} ppm ({crb.note})"
+            except Exception as exc:             # never let the referee crash the fit
+                note += f"; CRB unavailable ({type(exc).__name__})"
 
     return SourceEstimate(
-        x=x, y=y, Q=Q, stability_class=cls, u=float(u),
-        wind_dir_deg=float(wind_dir_deg), cost=cost, rmse_ppm=rmse,
-        residuals_ppm=[float(r) for r in resid],
-        n_sensors=n, crb_std=crb_std, converged=converged, note=note,
+        x=x, y=y, Q=Q, stability_class=cls, u=float(best_snaps[0].u),
+        wind_dir_deg=float(best_snaps[0].wind_dir_deg), cost=cost, rmse_ppm=rmse,
+        residuals_ppm=[float(r) for r in resid], n_sensors=n,
+        crb_std=crb_std, converged=converged, note=note, n_snapshots=K,
     )
 
 
@@ -350,3 +460,29 @@ def invert_field_tests(
     """
     pts = [aggregate_for_inversion(r, window_s=window_s) for r in results]
     return invert(sensor_positions, pts, u, wind_dir_deg, **kwargs)
+
+
+def invert_field_tests_multi(
+    snapshots,
+    sensor_positions,
+    window_s: float | None = None,
+    **kwargs,
+) -> SourceEstimate:
+    """
+    Multi-snapshot light switch from RAW processed field tests → one fused source.
+
+    This is the real deployment call when the wind veered during the test: group the
+    per-sensor records by wind episode, and pass one group per wind. Each ``snapshots``
+    entry is ``(results, u, wind_dir_deg)`` or ``(results, u, wind_dir_deg,
+    stability_class)``, where ``results`` is the per-sensor list of process_fieldtest
+    dicts captured under that wind. Each is aggregated (aggregate_for_inversion) and the
+    snapshots are fused by ``invert_multi`` — triangulating the source (BUGS.md F7).
+    """
+    snaps = []
+    for snap in snapshots:
+        results, u, wind_dir = snap[0], snap[1], snap[2]
+        stability = snap[3] if len(snap) > 3 else None
+        pts = [aggregate_for_inversion(r, window_s=window_s) for r in results]
+        snaps.append(Snapshot(points=pts, u=u, wind_dir_deg=wind_dir,
+                              stability_class=stability))
+    return invert_multi(sensor_positions, snaps, **kwargs)

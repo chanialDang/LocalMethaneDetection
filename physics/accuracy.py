@@ -423,6 +423,54 @@ class CRBound:
     note: str
 
 
+def _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class, receptors,
+                     params=("x", "y", "Q"), rel_step: float = 1e-3):
+    """Central-difference Jacobian: column j = ∂(ppm at receptors)/∂param_j.
+
+    clamp_to_table=True so a probe at the box edge never raises. Shared by the
+    single- and multi-snapshot CRB so both measure sensitivity identically.
+    """
+    receptors = np.asarray(receptors, dtype=float)
+    base = {"x": float(src_pos[0]), "y": float(src_pos[1]), "Q": float(Q)}
+
+    def predict(p):
+        return predict_ppm(
+            src_pos=(p["x"], p["y"]), Q=p["Q"], u=u, wind_dir_deg=wind_dir_deg,
+            H=H, stability_class=stability_class, receptors=receptors,
+            clamp_to_table=True,
+        )
+
+    cols = []
+    for name in params:
+        val = base[name]
+        if name in ("x", "y"):
+            h = max(rel_step * abs(val), 0.1)        # ≥ 0.1 m even near the origin
+        else:
+            h = max(rel_step * abs(val), 1e-3)
+        hi, lo = dict(base), dict(base)
+        hi[name] += h
+        lo[name] -= h
+        cols.append((predict(hi) - predict(lo)) / (2.0 * h))
+    return np.column_stack(cols)                        # (n_receptors, n_params)
+
+
+def _crb_from_fisher(F, params, n_receptors, sigma_ppm) -> CRBound:
+    """Invert a Fisher information matrix into a CRBound (pinv fallback if singular)."""
+    cond = float(np.linalg.cond(F))
+    try:
+        cov = np.linalg.inv(F)
+        note = "ok"
+    except np.linalg.LinAlgError:
+        cov = np.linalg.pinv(F)
+        note = "Fisher matrix singular (too few / degenerate receptors) — pinv used"
+    std = {name: float(np.sqrt(abs(cov[i, i]))) for i, name in enumerate(params)}
+    return CRBound(
+        params=tuple(params), std=std, cov=np.asarray(cov).tolist(),
+        n_receptors=int(n_receptors), sigma_ppm=float(sigma_ppm),
+        condition_number=cond, note=note,
+    )
+
+
 def crb_source_bound(
     src_pos,
     Q: float,
@@ -464,42 +512,45 @@ def crb_source_bound(
     those break.
     """
     receptors = np.asarray(receptors, dtype=float)
-    base = {"x": float(src_pos[0]), "y": float(src_pos[1]), "Q": float(Q)}
-
-    def predict(p):
-        return predict_ppm(
-            src_pos=(p["x"], p["y"]), Q=p["Q"], u=u, wind_dir_deg=wind_dir_deg,
-            H=H, stability_class=stability_class, receptors=receptors,
-            clamp_to_table=True,
-        )
-
-    # Numerical Jacobian: column j = ∂(ppm at receptors)/∂param_j (central diff).
-    cols = []
-    for name in params:
-        val = base[name]
-        if name in ("x", "y"):
-            h = max(rel_step * abs(val), 0.1)        # ≥ 0.1 m even near the origin
-        else:
-            h = max(rel_step * abs(val), 1e-3)
-        hi, lo = dict(base), dict(base)
-        hi[name] += h
-        lo[name] -= h
-        cols.append((predict(hi) - predict(lo)) / (2.0 * h))
-    J = np.column_stack(cols)                          # (n_receptors, n_params)
-
+    J = _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class,
+                         receptors, params, rel_step)
     F = J.T @ J / (sigma_ppm ** 2)                     # Fisher information
-    cond = float(np.linalg.cond(F))
-    try:
-        cov = np.linalg.inv(F)
-        note = "ok"
-    except np.linalg.LinAlgError:
-        cov = np.linalg.pinv(F)
-        note = "Fisher matrix singular (too few / degenerate receptors) — pinv used"
+    return _crb_from_fisher(F, params, receptors.shape[0], sigma_ppm)
 
-    std = {name: float(np.sqrt(abs(cov[i, i]))) for i, name in enumerate(params)}
 
-    return CRBound(
-        params=tuple(params), std=std, cov=np.asarray(cov).tolist(),
-        n_receptors=int(receptors.shape[0]), sigma_ppm=float(sigma_ppm),
-        condition_number=cond, note=note,
-    )
+def crb_source_bound_multi(
+    src_pos,
+    Q: float,
+    views,
+    H: float,
+    receptors,
+    sigma_ppm: float,
+    params=("x", "y", "Q"),
+    rel_step: float = 1e-3,
+) -> CRBound:
+    """
+    Combined Cramér-Rao bound when the SAME source + sensors are seen under several
+    winds (snapshots) — the theoretical floor for multi-snapshot fusion.
+
+    For independent measurements the Fisher information ADDS, so K snapshots give
+
+        F = Σ_k  J_kᵀ J_k / σ²
+
+    and the bound can only tighten as snapshots are added. This is the formal reason
+    fusing a few wind directions makes an otherwise under-determined single-wind
+    fenceline identifiable (BUGS.md F7): each new wind contributes its own Jacobian,
+    filling in the directions the others were blind to.
+
+    Parameters
+    ----------
+    views : list of (u, wind_dir_deg, stability_class) — one per snapshot, all sharing
+            the same source, geometry (H, receptors) and Q.
+    """
+    receptors = np.asarray(receptors, dtype=float)
+    p = len(params)
+    F = np.zeros((p, p))
+    for (u, wind_dir_deg, stability_class) in views:
+        J = _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class,
+                             receptors, params, rel_step)
+        F += J.T @ J / (sigma_ppm ** 2)
+    return _crb_from_fisher(F, params, receptors.shape[0], sigma_ppm)

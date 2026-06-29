@@ -80,16 +80,51 @@ Never delete a finding silently — a closed item is the proof the guard exists.
     equal `predict_ppm(..., clamp_to_table=True) − CH4_BACKGROUND` receptor-by-
     receptor — then adopt the kernel in the inversion behind that test.
 
-### F7 — local-minimum / ill-posedness is unguarded
-- [ ] **⚠ MED.** `tests/test_inversion.py:129` (`test_wide_search_box_is_clamp_safe`)
-  asserts only **finiteness** with a huge box — not that the **true** source is
-  recovered — and nothing tests answer stability across `coarse`/`grid`/`n_seeds`,
-  nor a degenerate (collinear) sensor layout.
-  - **Impact (inversion):** a confidently-wrong basin, or an under-determined layout
-    where Q/position trade off, passes silently as a clean answer.
-  - **Remove:** a wide-box test that still recovers the true source within tolerance;
-    plus a collinear-sensor test asserting a large CRB (`crb_std`) and/or honest
-    `converged` behaviour rather than false precision.
+### F7 — single-wind ill-posedness → CURED by multi-snapshot fusion
+- [x] **✅ RESOLVED (2026-06-29) via `invert_multi`. Single-wind localisation on a hard
+  fenceline is INHERENTLY under-determined; fusing a few wind directions fixes it.**
+  An earlier pass (2026-06-26) called this "partially closed" claiming only *extreme user
+  bounds* trigger a wrong basin and the **default** `_default_bounds` is safe. A realistic
+  hard dataset disproved that, and probing it further reframed the bug entirely:
+  - **It is NOT an optimiser local-minimum, and NOT fixable by a post-hoc uncertainty.**
+    On the fenceline geometry where one near sensor sees a strong plume and the rest read
+    ~background, only ~2 sensors carry real signal for 3 unknowns (x, y, Q) → genuinely
+    under-determined. Worse, leftover baseline-drift bias on the quiet sensors makes a
+    *wrong* location the legitimate maximum-likelihood fit (cost at the wrong basin < cost
+    at truth), so the single-wind fit lands ~28 m off while `converged=True`. Measured: no
+    local CRB, Birge-ratio (√reduced-χ²) inflation, profile-likelihood cost-surface spread,
+    or signal-count heuristic reliably separates the confidently-wrong cases from good ones
+    — the corrupted data really does prefer the wrong spot with low residuals.
+  - **The cure is more INFORMATION, not cleverer post-processing (user chose "actually
+    reduce the error").** Watching the same source under several wind directions
+    triangulates it: each wind sweeps the plume across a different sensor subset, and the
+    snapshots only agree at the true source. Q is shared (a steady leak emits the same g/s
+    under every wind) so it stays closed-form — now summed across snapshots — leaving the
+    same scipy-free 2-D grid search. Fisher information adds across snapshots
+    (`crb_source_bound_multi`), so the combined CRB can only tighten.
+  - **Measured (full pipeline, across seeds):** single wind ~28 m → **2 winds ~0.3 m, 3
+    winds ~0.5 m** (max 0.6 m), ~100 ms/fit. Note: each added snapshot SHARPENS the joint
+    basin, so `invert_multi` uses a denser default grid (`coarse=60, n_seeds=12`) than
+    `invert` (28/6); raise `coarse` further if you fuse many snapshots.
+  - **Shipped:** `physics/inversion.py` `invert_multi(sensor_positions, [Snapshot…])` +
+    `invert_field_tests_multi(snapshots, …)`; `Snapshot(points, u, wind_dir_deg,
+    stability_class=None)`; `physics/accuracy.py` `crb_source_bound_multi`. `invert` is now
+    the K=1 special case of `invert_multi` (pinned by
+    `test_invert_multi_equals_invert_for_single_snapshot`).
+  - **Tests:** `test_f7_single_snapshot_is_under_determined` (documents the ~28 m single-wind
+    limit), `test_f7_multi_snapshot_fusion_recovers_source` (3 winds → <5 m, the cure),
+    `test_f7_multi_snapshot_crb_tightens`, `test_multi_snapshot_tolerates_a_blind_snapshot`
+    (a wind that misses every sensor must not divide-by-zero). Builder
+    `_realistic_field_results(…, wind_dir, seed0)` makes the hard dataset through the full
+    deployment pipeline (what Custer/Melissa data will look like).
+  - **GOOD-case characterisation kept:** `test_collinear_sensors_crb_flags_ill_posedness` —
+    sensors on y=0 return `converged=True` with correct x/Q but `crb_std["y"] >
+    crb_std["x"]×3` (the CRB is honest there: ∂ppm/∂y_src ≈ 0 → tiny Fisher info for y).
+  - **Residual caveat (deprioritised, not lost):** a SINGLE-snapshot fit on an
+    under-determined layout still reports `converged=True` with an optimistic CRB (false
+    confidence). The honest-flag path (widen CRB / `converged=False` when a layout is
+    under-determined) was deprioritised in favour of the fusion fix; deployment guidance is
+    "fuse ≥2 winds, or place ≥3 sensors that all sit in the plume."
 
 ---
 

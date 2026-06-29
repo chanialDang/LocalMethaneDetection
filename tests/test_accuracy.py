@@ -165,3 +165,16 @@ def test_crb_scales_linearly_with_sigma():
                                    params=("Q",), **_CRB_KW)
     # cov ∝ σ² ⇒ std ∝ σ: doubling the noise doubles the best-possible 1σ.
     assert np.isclose(b2.std["Q"], 2.0 * b1.std["Q"], rtol=1e-6)
+
+
+def test_crb_finite_at_off_cardinal_wind():
+    # All CRB tests above use wind_dir_deg=270° (the identity rotation). Exercise
+    # the rotation path in predict_ppm's numerical Jacobian at a non-cardinal wind.
+    # Sensor fan is downwind of (5,-3) at 200° (from SSW → toward NNE).
+    recs = np.array([[10.0, 50.0], [30.0, 65.0], [20.0, 90.0], [40.0, 105.0]])
+    b = accuracy.crb_source_bound(
+        receptors=recs, sigma_ppm=0.30,
+        **{**_CRB_KW, "src_pos": (5.0, -3.0), "wind_dir_deg": 200.0},
+    )
+    for key in ("x", "y", "Q"):
+        assert np.isfinite(b.std[key]) and b.std[key] > 0

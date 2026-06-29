@@ -194,11 +194,19 @@ key, stdlib `urllib`). `fetch_wind_archive` is the only networked call;
 reference (`BUGS.md` F8).
 
 **`inversion.py`** (Week 3) — `invert(sensor_positions, points, u, wind_dir_deg,
-stability_class=None, …)` → `SourceEstimate(x, y, Q, …, crb_std, converged)`.
+stability_class=None, …)` → `SourceEstimate(x, y, Q, …, crb_std, converged, n_snapshots)`.
 **scipy-free:** the plume is linear in Q, so Q has a closed form `Q* = Σwgd/Σwg²` at
 every trial (x, y); only a 2-D position search remains (shrinking-grid, multi-start).
 Stability fit by trying all six. `invert_field_tests(results, …)` is the raw-CSV→source
 light switch. Compares scatter to the CRB; flags `converged=False` when no sensor beats 3σ.
+**Multi-snapshot fusion (F7 fix):** a single wind on a hard fenceline is under-determined
+(only ~2 sensors in the plume for 3 unknowns) and silently lands ~28 m off. `invert_multi(
+sensor_positions, [Snapshot(points, u, wind_dir_deg, stability_class=None)], …)` /
+`invert_field_tests_multi(snapshots, …)` fuse the SAME source seen under several winds —
+Q shared closed-form across snapshots (steady leak), joint 2-D search — triangulating it
+to sub-metre (2–3 winds). Fisher info adds → `accuracy.crb_source_bound_multi` is the
+combined (tighter) bound. `invert` is the K=1 case of `invert_multi`. Denser default grid
+(`coarse=60, n_seeds=12`) since each snapshot sharpens the joint basin. See `BUGS.md` F7.
 
 **`db.py`** — `DATABASE_URL` set → Railway Postgres (`psycopg`, lazy); unset → local
 SQLite `fieldtests.db` (offline + tests). Stores **only raw readings**; the processed
