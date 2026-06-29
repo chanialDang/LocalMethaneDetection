@@ -163,6 +163,14 @@ def _prep_points(points, n) -> tuple:
     d = np.array([m for m, _, _ in data])
     sig = np.array([s for _, s, _ in data])
     floor1 = np.array([f for _, _, f in data])
+    # Fail loud on a non-finite datum: a single NaN/inf reading otherwise propagates
+    # through the shared-Q sums and silently collapses the whole fit to Q≈0 /
+    # not-converged — a meaningless answer that looks like "saw nothing".
+    if not (np.all(np.isfinite(d)) and np.all(np.isfinite(sig))):
+        bad = [i for i in range(len(d))
+               if not (np.isfinite(d[i]) and np.isfinite(sig[i]))]
+        raise ValueError(f"non-finite reading or σ at sensor index(es) {bad}; "
+                         "every mean_excess_ppm and sigma_ppm must be finite")
     sig = np.where(sig > 1e-9, sig, 1e-9)                # guard a zero σ (infinite weight)
     return d, sig, floor1, 1.0 / (sig * sig)
 

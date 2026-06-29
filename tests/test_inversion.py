@@ -180,6 +180,19 @@ def test_mismatched_lengths_raise():
         inversion.invert(SENSORS, pts, WIND_U, WIND_DIR, stability_class=STAB)
 
 
+def test_non_finite_reading_raises():
+    # A NaN/inf datum must fail loud, not silently poison the shared-Q sums into a
+    # meaningless Q≈0 / not-converged "saw nothing". Independent of the optimiser:
+    # the guard is in _prep_points before any fit. The error names the bad sensor.
+    pts = _truth_points((5.0, 0.0), 6.0)
+    pts[1] = InversionPoint(
+        mean_excess_ppm=float("nan"), sigma_ppm=0.1, n_window=60, window=(0, 60),
+        mean_raw_ppm=float("nan"), baseline_ppm=CH4_BACKGROUND, random_ppm=0.1,
+        bias_ppm=0.0, detected=False)
+    with pytest.raises(ValueError, match="non-finite"):
+        inversion.invert(SENSORS, pts, WIND_U, WIND_DIR, stability_class=STAB)
+
+
 def test_wide_search_box_is_clamp_safe():
     # A huge box makes the grid probe positions that put sensors <1 m or >200 m
     # downwind; clamp_to_table inside predict_ppm must keep that from raising.
