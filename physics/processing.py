@@ -52,7 +52,7 @@ def moving_average(signal: np.ndarray, window: int) -> np.ndarray:
     fit averages optimally by itself, so smoothing first would only distort the
     noise model. The averaging the inversion DOES need (a time-mean over a
     meteorological "meander" window, to match the steady-state plume) lives in
-    fieldtest.aggregate_for_inversion. See ACCURACY.md "two averaging roles".
+    fieldtest.aggregate_for_inversion. See CLAUDE.md "two averaging roles".
 
     Edges are handled honestly: near the start/end, where a full window isn't
     available, we average over however many points DO exist (so the output is the

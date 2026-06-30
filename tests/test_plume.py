@@ -188,7 +188,7 @@ def test_vectorized_predict_ppm_matches_scalar_pipeline():
     assert np.allclose(vec, scalar, rtol=1e-9, atol=1e-12)
 
 
-# ── rotation: KNOWN ANSWERS at non-cardinal winds (BUGS.md F1) ───────────────
+# ── rotation: KNOWN ANSWERS at non-cardinal winds (CLAUDE.md F1) ───────────────
 # Every other rotation test uses wind = 270°, where the rotation collapses to the
 # identity (x_wind = dx, y_wind = dy) — so a sign flip, sin↔cos swap, or x↔y
 # transpose would pass the WHOLE suite, then silently mislocate the source at any
@@ -245,7 +245,7 @@ def test_vectorized_matches_scalar_off_cardinal():
     assert np.any(vec > CH4_BACKGROUND)                 # non-vacuous: some are downwind
 
 
-# ── unit conversion: an INDEPENDENT known value (BUGS.md F2) ─────────────────
+# ── unit conversion: an INDEPENDENT known value (CLAUDE.md F2) ─────────────────
 def test_gm3_to_ppm_known_value():
     """Magnitude anchor via the ideal-gas MOLAR VOLUME, not the code's constants.
     At T=293.15 K, P=101325 Pa:  V_m = R·T/P ≈ 0.024054 m³/mol (≈24 L/mol, the
@@ -262,7 +262,7 @@ def test_gm3_to_ppm_known_value():
     assert gm3_to_ppm_methane(1.0, T_K=2.0 * 293.15) == pytest.approx(2.0 * ppm, rel=1e-12)  # ∝ T
 
 
-# ── normalization: MASS CONSERVATION (BUGS.md F4) ────────────────────────────
+# ── normalization: MASS CONSERVATION (CLAUDE.md F4) ────────────────────────────
 # The conservation law is exactly x- and σ-independent (proof: ∫∫ collapses to Q/u
 # regardless of σ_y, σ_z), so a factor error scales every case identically. The
 # diagonal near→far × unstable→stable spans the full σ range and catches it as

@@ -122,7 +122,7 @@ def effective_noise_floor(
     in feasibility/accuracy (how low could the floor go if you averaged?), and
     (b) ``fieldtest.aggregate_for_inversion`` — the σ OF THE MEAN that weights one
     sensor's averaged reading in the Week-3 inversion. Both are the same quadrature;
-    note neither is "pre-smooth then fit" — see ACCURACY.md "two averaging roles".
+    note neither is "pre-smooth then fit" — see CLAUDE.md "two averaging roles".
     """
     if n_avg < 1:
         raise ValueError(f"n_avg must be ≥ 1, got {n_avg}")

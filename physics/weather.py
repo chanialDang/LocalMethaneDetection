@@ -45,7 +45,7 @@ Applications" (Feb 2000), Table 6-7 "Key to the SRDT Method", p.6-15:
 Treat the auto-class as a first guess, not an authority. Mitigated downstream: the
 inversion tries all six classes and feasibility reports the swing across neighbours.
 To align daytime with EPA, set the cutoffs to 925/675/175 and add a <175→D band
-(BUGS.md F8) — left as a user-owned change since it shifts the real-site stability class.
+(CLAUDE.md F8) — left as a user-owned change since it shifts the real-site stability class.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations

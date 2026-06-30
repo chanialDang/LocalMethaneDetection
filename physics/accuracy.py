@@ -21,7 +21,7 @@ in order (the Accuracy Protocol):
      could the random part go if you averaged N samples — it is bias-limited and
      flattens once bias dominates). The Week-3 inversion does NOT pre-average to
      reach it; a weighted least-squares fit averages optimally on its own. See
-     ACCURACY.md "two averaging roles" and fieldtest.aggregate_for_inversion.
+     CLAUDE.md "two averaging roles" and fieldtest.aggregate_for_inversion.
   4. GRADE      — fold it all into one 0-100 score, a letter, and the single most
      useful next action.
 
@@ -31,7 +31,7 @@ feasibility.py, plume.py) — no physics or signal processing is reimplemented h
 ⚠ HONESTY NOTE. The RANDOM noise is genuinely measurable from any record. The
   BIAS term measured in-record is only a PROXY (residual slow drift); a true,
   constant calibration offset can only be pinned with a known reference — a
-  zero-air bench run. See ACCURACY.md.
+  zero-air bench run. See CLAUDE.md.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -538,7 +538,7 @@ def crb_source_bound_multi(
 
     and the bound can only tighten as snapshots are added. This is the formal reason
     fusing a few wind directions makes an otherwise under-determined single-wind
-    fenceline identifiable (BUGS.md F7): each new wind contributes its own Jacobian,
+    fenceline identifiable (CLAUDE.md F7): each new wind contributes its own Jacobian,
     filling in the directions the others were blind to.
 
     Parameters

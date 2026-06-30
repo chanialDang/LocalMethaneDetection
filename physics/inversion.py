@@ -104,7 +104,7 @@ class Snapshot:
     """
     One observation of the SAME source + sensors under ONE wind. A multi-hour field
     deployment yields several of these as the wind veers; fusing them triangulates an
-    otherwise under-determined fenceline (see invert_multi / BUGS.md F7).
+    otherwise under-determined fenceline (see invert_multi / CLAUDE.md F7).
 
     ``points`` are this snapshot's per-sensor readings (InversionPoint objects or
     (mean_excess_ppm, sigma_ppm) pairs), in the same sensor order as every other
@@ -186,7 +186,7 @@ def _eval_cells(xs, ys, sensors_xy, snaps, H, z, T_K, P_Pa) -> list:
         Q* = Σ_k Σ_i w g d  /  Σ_k Σ_i w g²        (clamped ≥ 0)
 
     K=1 reduces to the original per-cell WLS amplitude; K≥2 is what makes an
-    under-determined single-wind fenceline identifiable (BUGS.md F7). One
+    under-determined single-wind fenceline identifiable (CLAUDE.md F7). One
     predict_excess_grid pass per snapshot pays the σ-table/rotation setup once per
     lattice (pinned vs predict_ppm by test_predict_excess_grid_matches_predict_ppm)."""
     src_grid = np.array([(float(x), float(y)) for x in xs for y in ys])
@@ -297,7 +297,7 @@ def invert(
     bounds           : (x0, x1, y0, y1) search box (m); default = sensors' bbox + 150 m.
                        Avoid boxes >> the default: when a single near-sensor sees huge
                        excess, the coarse grid can lock onto a spurious basin with a
-                       huge Q rather than the true source (see BUGS.md F7).
+                       huge Q rather than the true source (see CLAUDE.md F7).
     coarse, grid, rounds, shrink, n_seeds : two-stage optimiser controls (see _fit_xy):
                        ``coarse`` = full-box scan resolution; the best ``n_seeds``
                        basins are each refined with a ``grid``-cell local zoom over
@@ -343,7 +343,7 @@ def invert_multi(
     """
     Recover ONE steady source from the SAME sensors observed under several winds.
 
-    This is the cure for the single-wind ill-posedness of BUGS.md F7. A fenceline where
+    This is the cure for the single-wind ill-posedness of CLAUDE.md F7. A fenceline where
     only a sensor or two sits in the plume is under-determined from one snapshot — many
     (x, y, Q) explain the readings equally, and the fit can land tens of metres away
     while looking confident. Watching the leak from several wind directions TRIANGULATES
@@ -488,7 +488,7 @@ def invert_field_tests_multi(
     entry is ``(results, u, wind_dir_deg)`` or ``(results, u, wind_dir_deg,
     stability_class)``, where ``results`` is the per-sensor list of process_fieldtest
     dicts captured under that wind. Each is aggregated (aggregate_for_inversion) and the
-    snapshots are fused by ``invert_multi`` — triangulating the source (BUGS.md F7).
+    snapshots are fused by ``invert_multi`` — triangulating the source (CLAUDE.md F7).
     """
     snaps = []
     for snap in snapshots:

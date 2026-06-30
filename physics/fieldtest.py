@@ -307,7 +307,7 @@ def aggregate_for_inversion(result: dict, window_s: float | None = None) -> Inve
       • The mean is taken over the UNSMOOTHED excess (``raw − baseline``). Pre-smoothing
         with moving_average is deliberately skipped: a least-squares fit over the
         window already averages optimally, so smoothing first would only distort the
-        noise model. (See the module + ACCURACY.md "two averaging roles" note.)
+        noise model. (See the module + CLAUDE.md "two averaging roles" note.)
       • ``sigma_ppm`` is the σ OF THE MEAN, combining the averageable random noise
         (÷√N over the window) with the non-averageable bias, via the shared
         ``sensor_sim.effective_noise_floor``. That is the correct weight for WLS.
