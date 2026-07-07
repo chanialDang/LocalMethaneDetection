@@ -93,6 +93,19 @@ def test_effective_noise_floor_rejects_bad_inputs():
         effective_noise_floor(0.30, 0.0, 0)
 
 
+def test_effective_noise_floor_rho_reduces_effective_n():
+    # AR(1) effective sample size: n_eff = n·(1−ρ)/(1+ρ). Hand-calc for ρ=0.5,
+    # n=100 → n_eff = 100/3, so the random part shrinks by √(100/3), not √100.
+    expected = np.hypot(0.30 / np.sqrt(100.0 / 3.0), 0.10)
+    assert effective_noise_floor(0.30, 0.10, 100, rho=0.5) == pytest.approx(expected)
+    # ρ=0 is the i.i.d. case — must match the two-arg behaviour exactly.
+    assert (effective_noise_floor(0.30, 0.10, 100, rho=0.0)
+            == pytest.approx(effective_noise_floor(0.30, 0.10, 100)))
+    # ρ→1: n_eff floors at 1 — averaging buys nothing on a fully correlated record.
+    assert effective_noise_floor(0.30, 0.0, 100, rho=0.99) <= 0.30
+    assert effective_noise_floor(0.30, 0.0, 100, rho=0.99) >= 0.30 / np.sqrt(2.0)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Sensitivity / implied-Q error bar (Fix 1) — wind & stability spread Q widely.
 # ─────────────────────────────────────────────────────────────────────────────

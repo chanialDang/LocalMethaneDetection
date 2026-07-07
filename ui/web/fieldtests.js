@@ -27,6 +27,7 @@ wireUpload();
 wireSample();
 wireInterpret();
 $('compareBtn').addEventListener('click', () => loadCompare([...state.compareSel]));
+$('invertBtn').addEventListener('click', () => runInvert([...state.compareSel]));
 CH4.mountChat({
   logEl: $('ftChatLog'), formEl: $('ftChatForm'), inputEl: $('ftChatInput'),
   sendEl: $('ftChatSend'), seedsEl: $('ftChatSeeds'),
@@ -96,6 +97,9 @@ function toggleCompare(id, on) {
   const btn = $('compareBtn');
   btn.textContent = `Compare (${n})`;
   btn.disabled = n < 2;
+  const ibtn = $('invertBtn');
+  ibtn.textContent = `Invert (${n})`;
+  ibtn.disabled = n < 2;
 }
 
 // ─── selection / single-test render ─────────────────────────────────────────────
@@ -120,13 +124,91 @@ function renderSingle(d) {
   $('ftEmpty').hidden = true;
   $('seriesKey').hidden = false;
   $('ftMetrics').hidden = false;
+  $('accuracyPanel').hidden = false;
   $('spreadPanel').hidden = true;
+  $('invertPanel').hidden = true;
 
   renderMetrics(d.facts);
+  renderWarnings(d.warnings);
   if (d.series) renderSinglePlot(d.series);
   renderList(state.tests);             // refresh selection highlight
   enableAssistant(true);
   resetAssistant();
+  // The accuracy report rides the same response — no second request, and the
+  // server only runs the cleaning pipeline once per view.
+  if (d.accuracy) renderAccuracy(d.accuracy);
+  else {
+    $('accuracyGrade').textContent = '—';
+    $('accuracyBody').textContent = 'No readings to assess.';
+  }
+}
+
+// ─── data-quality warnings ───────────────────────────────────────────────────────
+function renderWarnings(warnings) {
+  const panel = $('warnPanel');
+  if (!warnings || !warnings.length) { panel.hidden = true; return; }
+  $('warnList').innerHTML =
+    warnings.map((w) => `<li>${CH4.esc(w)}</li>`).join('');
+  panel.hidden = false;
+}
+
+// ─── accuracy report ─────────────────────────────────────────────────────────────
+function renderAccuracy(a) {
+  $('accuracyGrade').textContent = `${a.grade ?? '—'} · ${a.score ?? '—'}/100`;
+  const floor = a.detection_limit && a.detection_limit.curve && a.detection_limit.curve[0];
+  const measuredFloor = floor ? `${floor.floor_ppm.toFixed(3)} ppm` : '—';
+  $('accuracyBody').innerHTML = `
+    <table class="spread__table">
+      <tbody>
+        <tr><th>measured floor (vs assumed ${a.assumed_floor_ppm ?? '—'} ppm)</th><td>${measuredFloor}</td></tr>
+        <tr><th>SNR</th><td>${a.confidence_sigmas ? a.confidence_sigmas.toFixed(1) + 'σ' : '—'}</td></tr>
+        <tr><th>bias fraction</th><td>${a.bias_fraction != null ? (a.bias_fraction * 100).toFixed(0) + '%' : '—'}</td></tr>
+      </tbody>
+    </table>
+    <p class="caption">${CH4.esc(a.recommendation || '')}</p>`;
+}
+
+// ─── multi-snapshot inversion ────────────────────────────────────────────────────
+async function runInvert(ids) {
+  if (ids.length < 2) return;
+  $('readoutLabel').textContent = 'INVERT';
+  $('readoutSub').textContent = `fusing ${ids.length} selected tests…`;
+  $('ftEmpty').hidden = true;
+  $('seriesKey').hidden = true;
+  $('ftMetrics').hidden = true;
+  $('accuracyPanel').hidden = true;
+  $('spreadPanel').hidden = true;
+  $('invertPanel').hidden = false;
+  $('invertBody').innerHTML = 'fusing…';
+  $('invertAssumption').textContent = '';
+  try {
+    const r = await fetch('/api/fieldtests/invert', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    });
+    const est = await r.json();
+    if (!r.ok || est.error) { $('invertBody').textContent = est.error || 'Inversion failed.'; return; }
+    renderInvert(est);
+  } catch (e) {
+    $('invertBody').textContent = 'Could not reach the inversion endpoint.';
+  }
+}
+
+function renderInvert(est) {
+  $('readoutSub').textContent = `${est.n_snapshots} wind episode(s) fused`;
+  const crb = est.crb_std || {};
+  const fmt = (v, d = 2) => (v == null || !isFinite(v)) ? '—' : Number(v).toFixed(d);
+  $('invertBody').innerHTML = `
+    <table class="spread__table">
+      <tbody>
+        <tr><th>x, y (m, relative to sensor)</th><td>${fmt(est.x)}, ${fmt(est.y)}</td></tr>
+        <tr><th>Q (g/s)</th><td>${fmt(est.Q, 3)}</td></tr>
+        <tr><th>converged</th><td>${est.converged ? 'yes' : 'no'}</td></tr>
+        <tr><th>ill-posed</th><td>${est.ill_posed ? 'YES — treat with caution' : 'no'}</td></tr>
+        <tr><th>CRB best-possible 1σ</th><td>x ${fmt(crb.x)} · y ${fmt(crb.y)} · Q ${fmt(crb.Q, 3)}</td></tr>
+      </tbody>
+    </table>`;
+  $('invertAssumption').textContent = est.assumption || '';
 }
 
 function renderMetrics(f) {
@@ -214,6 +296,8 @@ function renderCompare(d) {
   $('ftEmpty').hidden = true;
   $('seriesKey').hidden = true;
   $('ftMetrics').hidden = true;
+  $('accuracyPanel').hidden = true;
+  $('invertPanel').hidden = true;
   $('spreadPanel').hidden = false;
 
   const ramp = [C.amber, C.green, C.blue, '#d2a8ff', '#56d4dd', '#ff9a52', '#f778ba'];
@@ -291,7 +375,9 @@ function showEmpty() {
   $('ftEmpty').hidden = false;
   $('seriesKey').hidden = true;
   $('ftMetrics').hidden = true;
+  $('accuracyPanel').hidden = true;
   $('spreadPanel').hidden = true;
+  $('invertPanel').hidden = true;
   $('readoutSub').textContent = 'select or upload a field test';
   Plotly.purge('ftPlot');
   enableAssistant(false);

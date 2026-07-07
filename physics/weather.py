@@ -29,23 +29,21 @@ DESIGN NOTES
 • The 10 m archive wind is height-adjusted toward the near-ground release height
   with a log-law profile; using 10 m wind raw would overstate u and so understate Q.
 
-⚠ VALIDATION CAVEAT (do not skip) — F8 VERIFIED 2026-06-25, cutoffs DIVERGE
+⚠ VALIDATION CAVEAT (do not skip) — F8 FIXED 2026-06-30, cutoffs now match EPA
 ───────────────────────────────────────────────────────────────────────────────
-The daytime W/m² cutoffs below (700/350) do NOT match the cited EPA method. Checked
-against EPA-454/R-99-005 "Meteorological Monitoring Guidance for Regulatory Modeling
-Applications" (Feb 2000), Table 6-7 "Key to the SRDT Method", p.6-15:
+The daytime W/m² cutoffs are checked against EPA-454/R-99-005 "Meteorological
+Monitoring Guidance for Regulatory Modeling Applications" (Feb 2000), Table 6-7
+"Key to the SRDT Method", p.6-15:
   • EPA daytime solar-radiation bands are ≥925 / 925–675 / 675–175 / <175 W/m² (FOUR
-    levels, incl. a <175→D near-neutral band). This code uses two cutoffs (700/350 →
-    three levels) with no <175→D band, biasing daytime classes too UNSTABLE — it calls
-    700 W/m² "strong", whereas EPA's "strong" is ≥925 (700 is EPA "moderate").
-  • The daytime WIND bands here (<2, 2–3, 3–5, 5–6, ≥6 m/s) DO match EPA Table 6-7.
+    levels, incl. a <175→D near-neutral band, returned regardless of wind). This
+    module uses exactly those four cutoffs (``_INSOL_STRONG=925``,
+    ``_INSOL_MODERATE=675``, ``_INSOL_NEARNEUTRAL=175``).
+  • The daytime WIND bands here (<2, 2–3, 3–5, 5–6, ≥6 m/s) match EPA Table 6-7.
   • NIGHT: EPA SRDT keys off the vertical temperature gradient ΔT (<0 vs ≥0), wind
     bands <2.0 / 2.0–2.5 / ≥2.5 m/s. This code uses CLOUD COVER instead (Turner's cloud
     method, Table 6-4) because Open-Meteo supplies cloud, not ΔT — a documented deviation.
 Treat the auto-class as a first guess, not an authority. Mitigated downstream: the
 inversion tries all six classes and feasibility reports the swing across neighbours.
-To align daytime with EPA, set the cutoffs to 925/675/175 and add a <175→D band
-(CLAUDE.md F8) — left as a user-owned change since it shifts the real-site stability class.
 ═══════════════════════════════════════════════════════════════════════════════
 """
 from __future__ import annotations
@@ -74,10 +72,11 @@ SITES = {
     "melissa": (33.29, -96.57),
 }
 
-# ── Pasquill–Turner cutoffs (SEE VALIDATION CAVEAT — verify before trusting) ──
-# Daytime incoming-solar bands (W/m²): strong / moderate / slight insolation.
-_INSOL_STRONG = 700.0
-_INSOL_MODERATE = 350.0
+# ── Pasquill–Turner cutoffs (EPA-454/R-99-005 Table 6-7, see VALIDATION CAVEAT) ──
+# Daytime incoming-solar bands (W/m²): strong / moderate / slight / near-neutral.
+_INSOL_STRONG = 925.0
+_INSOL_MODERATE = 675.0
+_INSOL_NEARNEUTRAL = 175.0   # below this, daytime is near-neutral → class D outright
 _INSOL_SLIGHT = 1.0          # >0 but weak; below this we treat it as night
 # Night cloud-cover split (%): "overcast/cloudy" vs "mostly clear".
 _CLOUD_OVERCAST = 50.0
@@ -124,23 +123,27 @@ def pasquill_class(wind_speed: float, shortwave_radiation: float,
 
     if is_day:
         rad = float(shortwave_radiation)
-        if rad >= _INSOL_STRONG:
-            insol = "strong"
-        elif rad >= _INSOL_MODERATE:
-            insol = "moderate"
+        if rad < _INSOL_NEARNEUTRAL:
+            # EPA's near-neutral daytime band: class D regardless of wind.
+            cls = "D"
         else:
-            insol = "slight"
-        # rows by wind band; values are the (unstable-rounded) class A–F.
-        if u < 2.0:
-            cls = {"strong": "A", "moderate": "A", "slight": "B"}[insol]
-        elif u < 3.0:
-            cls = {"strong": "A", "moderate": "B", "slight": "C"}[insol]
-        elif u < 5.0:
-            cls = {"strong": "B", "moderate": "B", "slight": "C"}[insol]
-        elif u < 6.0:
-            cls = {"strong": "C", "moderate": "C", "slight": "D"}[insol]
-        else:
-            cls = {"strong": "C", "moderate": "D", "slight": "D"}[insol]
+            if rad >= _INSOL_STRONG:
+                insol = "strong"
+            elif rad >= _INSOL_MODERATE:
+                insol = "moderate"
+            else:
+                insol = "slight"
+            # rows by wind band; values are the (unstable-rounded) class A–F.
+            if u < 2.0:
+                cls = {"strong": "A", "moderate": "A", "slight": "B"}[insol]
+            elif u < 3.0:
+                cls = {"strong": "A", "moderate": "B", "slight": "C"}[insol]
+            elif u < 5.0:
+                cls = {"strong": "B", "moderate": "B", "slight": "C"}[insol]
+            elif u < 6.0:
+                cls = {"strong": "C", "moderate": "C", "slight": "D"}[insol]
+            else:
+                cls = {"strong": "C", "moderate": "D", "slight": "D"}[insol]
     else:
         overcast = float(cloud_cover) >= _CLOUD_OVERCAST
         if u < 3.0:

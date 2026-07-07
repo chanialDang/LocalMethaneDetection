@@ -44,13 +44,21 @@ def test_parse_ppm_only():
     assert out["temperature"] is None and out["humidity"] is None
 
 
-def test_parse_skips_nonnumeric_rows_and_partial_weather_is_dropped():
-    # row "x" has no number → skipped; humidity has a gap → whole column dropped.
+def test_parse_skips_nonnumeric_rows_and_gappy_weather_keeps_nan():
+    # row "x" has no number → skipped; a humidity gap stays as NaN — parse reports
+    # reality, and process_fieldtest owns the drop-or-interpolate policy.
     text = "time,ppm,humidity\n0,1.9,55\n1,x,55\n2,2.5,\n"
     out = fieldtest.parse_csv(text)
     assert out["n"] == 2                       # the 'x' row was skipped
     assert np.allclose(out["ppm"], [1.9, 2.5])
-    assert out["humidity"] is None             # partial column → unusable → None
+    assert out["humidity"] is not None
+    assert np.isnan(out["humidity"][1])        # the gap is preserved, not invented
+
+    # Too few real values to trust an interpolation → process drops the column.
+    res = fieldtest.process_fieldtest(out["ppm"], humidity=out["humidity"],
+                                      temperature=np.array([20.0, np.nan]))
+    assert res["humidity"] is None and res["temperature"] is None
+    assert res["weather_corrected"] is False
 
 
 def test_parse_no_ppm_column_raises():
@@ -61,6 +69,167 @@ def test_parse_no_ppm_column_raises():
 def test_parse_empty_raises():
     with pytest.raises(ValueError):
         fieldtest.parse_csv("")
+
+
+# ─── CSV hardening: NaN/Inf, unit sanity, timestamps, sample rate ───────────────
+def test_parse_nan_and_inf_ppm_rows_are_skipped():
+    # A failed analogRead is a real Arduino artifact — "nan"/"inf" cells must not
+    # corrupt the array (they used to: float("nan") parses "successfully").
+    text = "time,ppm\n0,1.9\n1,nan\n2,inf\n3,-inf\n4,2.1\n"
+    out = fieldtest.parse_csv(text)
+    assert out["n"] == 2                          # only the 2 finite rows kept
+    assert np.allclose(out["ppm"], [1.9, 2.1])
+    assert not np.isnan(out["ppm"]).any()
+    assert any("skipped" in w for w in out["warnings"])
+
+
+def test_process_warns_on_unit_mismatch_but_does_not_reject():
+    # A raw 16-bit-ADC-like column under a generic header ("value") is still
+    # accepted as ppm (renaming the accepted headers is out of scope) but flagged
+    # — and never dropped, since a real huge leak can legitimately read high. Note
+    # a 10/12-bit ADC's raw range (0-4095) overlaps the sensor's rated ppm ceiling
+    # and genuinely can't be told apart by magnitude alone; this fixture uses a
+    # wider raw range where the mismatch IS detectable. The check lives in
+    # process_fieldtest (not parse_csv) so STORED tests re-warn on every read.
+    out = fieldtest.parse_csv("value\n0\n20000\n40000\n65535\n")
+    assert out["n"] == 4                           # nothing rejected
+    res = fieldtest.process_fieldtest(out["ppm"])
+    assert any("plausible" in w for w in res["warnings"])
+
+
+def test_in_range_ppm_has_no_unit_warning():
+    out = fieldtest.parse_csv("ppm\n1.9\n2.4\n3.0\n")
+    assert out["warnings"] == []
+    assert fieldtest.process_fieldtest(out["ppm"])["warnings"] == []
+
+
+def test_parse_sorts_unsorted_timestamps():
+    text = "time,ppm\n5,5.0\n1,1.0\n3,3.0\n"
+    out = fieldtest.parse_csv(text)
+    assert np.allclose(out["time"], [1, 3, 5])
+    assert np.allclose(out["ppm"], [1.0, 3.0, 5.0])   # ppm permuted to match
+    assert any("sorted by time" in w for w in out["warnings"])
+
+
+def test_parse_flags_duplicate_timestamps():
+    text = "time,ppm\n0,1.0\n0,1.1\n1,2.0\n"
+    out = fieldtest.parse_csv(text)
+    assert out["n"] == 3                            # duplicates are kept, not dropped
+    assert any("duplicate" in w for w in out["warnings"])
+
+
+def test_process_interpolates_sparse_weather_gaps():
+    # 9 of 10 humidity values present (>= _MIN_GOOD_FOR_INTERP=8): parse keeps the
+    # gap as NaN (never invents data); process fills it for the subtraction step
+    # and warns — a few dropped serial-print lines don't disable weather correction.
+    rows = "\n".join(f"{i},2.0,{50 + i if i != 5 else ''}" for i in range(10))
+    text = "time,ppm,humidity\n" + rows + "\n"
+    out = fieldtest.parse_csv(text)
+    assert out["humidity"] is not None and np.isnan(out["humidity"][5])
+    res = fieldtest.process_fieldtest(out["ppm"], humidity=out["humidity"])
+    assert res["humidity"].shape == (10,)
+    assert not np.isnan(res["humidity"]).any()
+    assert res["humidity"][5] == pytest.approx(55.0)   # linear fill between 54 (i=4) and 56 (i=6)
+    assert any("interpolated" in w for w in res["warnings"])
+
+
+def test_parse_warns_on_partial_time_column():
+    # One blank timestamp used to silently drop the whole clock (file order assumed,
+    # no sorting, no flag). The drop still happens — a gappy clock can't be trusted
+    # — but it must be SAID.
+    text = "time,ppm\n0,1.9\n,2.0\n2,2.1\n"
+    out = fieldtest.parse_csv(text)
+    assert out["time"] is None
+    assert any("time" in w.lower() for w in out["warnings"])
+
+
+def test_weather_fit_ignores_interpolated_gap_through_event():
+    # The T/H logger drops out exactly during the plume event and the temperature
+    # steps 20→26 °C across the gap (sensor heated). Interpolation fills the gap
+    # with a ramp that rises WITH the plume bump — if the weather fit trains on
+    # those invented samples it learns a fake a_temp and subtracts real methane.
+    # The fit must use only REAL samples (where reading is flat at background).
+    n = 120
+    ppm = np.full(n, 1.9)
+    ppm[40:70] += 5.0                                   # known truth: +5 ppm event
+    temp = np.full(n, 20.0)
+    temp[70:] = 26.0
+    humid = np.full(n, 50.0)
+    temp[40:70] = np.nan                                # gap spans the event
+    humid[40:70] = np.nan
+    res = fieldtest.process_fieldtest(ppm, temperature=temp, humidity=humid,
+                                      noise_ppm=0.30)
+    # Independent expectation: real samples are flat 1.9 at both T=20 and T=26, so
+    # the true weather coefficient is 0 and the event must survive intact.
+    event_excess = (res["raw"] - res["baseline"])[40:70].mean()
+    assert event_excess == pytest.approx(5.0, rel=0.15)
+    assert res["detection"].detected
+
+
+def test_nasty_csv_end_to_end_alignment_and_warnings():
+    # One deliberately horrible upload: shuffled timestamps, a duplicate stamp,
+    # junk/NaN/Inf ppm cells, a T/H logger gap, and a negative reading. The
+    # pipeline must (a) keep every surviving row aligned across columns after
+    # sorting, (b) enumerate each problem in warnings, and (c) produce the same
+    # cleaned series as the equivalent hand-sorted clean file.
+    nasty = (
+        "time,ppm,temperature,humidity\n"
+        "4,2.4,20.4,50.4\n"
+        "0,2.0,20.0,50.0\n"
+        "1,junk,99,99\n"          # skipped row: its T/H must vanish with it
+        "2,2.2,,\n"               # T/H gap at t=2
+        "1,2.1,20.1,50.1\n"
+        "3,2.3,20.3,50.3\n"
+        "5,nan,1,1\n"             # skipped (NaN ppm)
+        "6,inf,1,1\n"             # skipped (Inf ppm)
+        "3,-0.5,20.3,50.3\n"      # duplicate stamp + negative reading, kept
+    )
+    out = fieldtest.parse_csv(nasty)
+    assert out["n"] == 6
+    assert np.allclose(out["time"], [0, 1, 2, 3, 3, 4])
+    # Alignment survives the sort: ppm at t=0 is 2.0 and its T/H are the row's own.
+    assert out["ppm"][0] == pytest.approx(2.0)
+    assert out["temperature"][0] == pytest.approx(20.0)
+    assert out["humidity"][5] == pytest.approx(50.4)
+    assert np.isnan(out["temperature"][2]) and np.isnan(out["humidity"][2])
+    w = " | ".join(out["warnings"])
+    assert "skipped" in w and "sorted by time" in w and "duplicate" in w
+
+    # The clean equivalent (pre-sorted, junk rows removed, gap left blank) must
+    # produce byte-identical processing output — the mess itself carries no signal.
+    clean = (
+        "time,ppm,temperature,humidity\n"
+        "0,2.0,20.0,50.0\n"
+        "1,2.1,20.1,50.1\n"
+        "2,2.2,,\n"
+        "3,2.3,20.3,50.3\n"
+        "3,-0.5,20.3,50.3\n"
+        "4,2.4,20.4,50.4\n"
+    )
+    ref = fieldtest.parse_csv(clean)
+    res_nasty = fieldtest.process_fieldtest(out["ppm"], temperature=out["temperature"],
+                                            humidity=out["humidity"], time=out["time"])
+    res_ref = fieldtest.process_fieldtest(ref["ppm"], temperature=ref["temperature"],
+                                          humidity=ref["humidity"], time=ref["time"])
+    assert np.allclose(res_nasty["excess"], res_ref["excess"], equal_nan=True)
+    assert np.allclose(res_nasty["baseline"], res_ref["baseline"], equal_nan=True)
+
+
+def test_process_fieldtest_invalid_sample_rate_falls_back():
+    ppm = 1.9 + np.random.default_rng(0).normal(0, 0.1, size=50)
+    res = fieldtest.process_fieldtest(ppm, sample_rate_hz=-1.0)
+    assert np.allclose(res["time"], np.arange(50) / 1.0)
+    assert any("plausible cadence" in w for w in res["warnings"])
+
+    res2 = fieldtest.process_fieldtest(ppm, sample_rate_hz=1e6)
+    assert np.allclose(res2["time"], np.arange(50) / 1.0)
+    assert any("plausible cadence" in w for w in res2["warnings"])
+
+
+def test_process_fieldtest_valid_sample_rate_has_no_warning():
+    ppm = 1.9 + np.random.default_rng(0).normal(0, 0.1, size=50)
+    res = fieldtest.process_fieldtest(ppm, sample_rate_hz=2.0)
+    assert res["warnings"] == []
 
 
 # ─── process_fieldtest ──────────────────────────────────────────────────────────
@@ -204,6 +373,63 @@ def test_aggregate_window_matches_detected_event_exactly():
     pt = fieldtest.aggregate_for_inversion(res)
     assert pt.window == (det.start_idx, det.end_idx)
     assert pt.n_window == det.end_idx - det.start_idx
+
+
+def test_aggregate_inflates_sigma_for_autocorrelated_records():
+    # F6: an AR(1)-correlated quiet record shrinks slower than sqrt(N), so its
+    # sigma_ppm (the WLS weight / CRB input) must come out LARGER than the naive
+    # i.i.d. assumption (n_avg=n_window) would give -- otherwise the inversion's
+    # reported confidence is silently overconfident when a real source IS present.
+    rng = np.random.default_rng(21)
+    e = rng.normal(0, 0.30 * np.sqrt(1 - 0.9 ** 2), size=600)
+    x = np.empty(600)
+    x[0] = e[0]
+    for i in range(1, 600):
+        x[i] = 0.9 * x[i - 1] + e[i]
+    ppm = 1.9 + x
+    res = fieldtest.process_fieldtest(ppm, noise_ppm=0.30)
+    pt = fieldtest.aggregate_for_inversion(res)
+
+    assert pt.rho_hat > 0.6                       # recovers the strong correlation
+    assert pt.n_eff is not None and pt.n_eff < pt.n_window
+
+    from physics.sensor_sim import effective_noise_floor
+    naive_sigma = effective_noise_floor(pt.random_ppm, pt.bias_ppm,
+                                        n_avg=max(1, pt.n_window))
+    assert pt.sigma_ppm > naive_sigma               # correctly inflated, not overconfident
+
+
+def test_aggregate_white_noise_sigma_matches_naive_iid_assumption():
+    # Control case: i.i.d. noise has rho_hat ~ 0, so n_eff ~ n_window and sigma_ppm
+    # should be close to the old (pre-F6) naive iid calculation -- the fix must not
+    # change behaviour on data that was already handled correctly.
+    rng = np.random.default_rng(22)
+    ppm = 1.9 + rng.normal(0, 0.30, size=600)
+    res = fieldtest.process_fieldtest(ppm, noise_ppm=0.30)
+    pt = fieldtest.aggregate_for_inversion(res)
+
+    assert pt.rho_hat < 0.3
+    from physics.sensor_sim import effective_noise_floor
+    naive_sigma = effective_noise_floor(pt.random_ppm, pt.bias_ppm,
+                                        n_avg=max(1, pt.n_window))
+    assert pt.sigma_ppm == pytest.approx(naive_sigma, rel=0.25)
+
+
+def test_aggregate_event_dominated_record_keeps_weight():
+    # A short record where the detected event fills nearly everything leaves too
+    # little quiet data to measure rho — the fallback must NOT measure rho on the
+    # smooth plume bump itself (corrcoef of a bump → ~0.98 → n_eff floors at 1 and
+    # the strongest detection gets down-weighted out of the WLS fit). With no
+    # trustworthy quiet stretch, the honest answer is "no correction" (rho = 0).
+    rng = np.random.default_rng(7)
+    n = 40
+    t = np.arange(n)
+    ppm = 1.9 + 6.0 * np.exp(-0.5 * ((t - 20) / 8.0) ** 2) + rng.normal(0, 0.3, n)
+    res = fieldtest.process_fieldtest(ppm, noise_ppm=0.30)
+    assert res["detection"].detected
+    pt = fieldtest.aggregate_for_inversion(res)
+    assert pt.rho_hat == 0.0
+    assert pt.n_eff == pytest.approx(pt.n_window)
 
 
 def test_aggregate_exposes_both_bias_framings():

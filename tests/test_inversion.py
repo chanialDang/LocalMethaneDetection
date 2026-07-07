@@ -98,6 +98,40 @@ def test_Q_is_linear_closed_form():
     assert dbl.y == pytest.approx(base.y, abs=1e-6)
 
 
+def test_non_default_T_K_threads_through_fit_and_crb():
+    # T/P wiring: gm3_to_ppm_methane's ppm scales linearly with T_K, so generating
+    # truth data at a real, non-default temperature and inverting WITHOUT passing
+    # that same T_K must bias the recovered Q -- passing it must recover Q exactly.
+    # This also guards a newly-found gap: the CRB silently used the 293.15K default
+    # even when invert_multi's WLS fit used a real measured T_K.
+    true_src, Q_true, T_K_true = (5.0, -3.0), 6.0, 305.0   # ~32 C, a real hot-day reading
+    total = predict_ppm(true_src, Q_true, WIND_U, WIND_DIR, H, STAB, SENSORS, z=Z,
+                        T_K=T_K_true)
+    excess = total - CH4_BACKGROUND
+    sigma = 0.1
+    pts = [
+        InversionPoint(mean_excess_ppm=float(e), sigma_ppm=sigma, n_window=60,
+                       window=(0, 60), mean_raw_ppm=float(e) + CH4_BACKGROUND,
+                       baseline_ppm=CH4_BACKGROUND, random_ppm=sigma, bias_ppm=0.0,
+                       detected=True)
+        for e in excess
+    ]
+    est_default = inversion.invert(SENSORS, pts, WIND_U, WIND_DIR, stability_class=STAB,
+                                   H=H, z=Z)
+    est_real = inversion.invert(SENSORS, pts, WIND_U, WIND_DIR, stability_class=STAB,
+                                H=H, z=Z, T_K=T_K_true)
+
+    # Fit: only the T_K-matched inversion recovers the true Q closely (residual
+    # tolerance accounts for the shrinking-grid search's finite resolution, not
+    # the T_K wiring itself -- the default case is off by a much larger margin).
+    assert est_real.Q == pytest.approx(Q_true, rel=2e-2)
+    assert abs(est_default.Q - Q_true) > 3 * abs(est_real.Q - Q_true)
+
+    # CRB: must actually change with T_K, else it's silently still using the default.
+    assert est_default.crb_std is not None and est_real.crb_std is not None
+    assert est_default.crb_std["Q"] != pytest.approx(est_real.crb_std["Q"], rel=1e-6)
+
+
 def test_estimates_stability_class_when_unknown():
     # Generate at class B (2); invert with stability unknown → it should pick 2,
     # because only the true class makes the across-sensor SHAPE fit at zero cost.
@@ -230,6 +264,28 @@ def test_collinear_sensors_crb_flags_ill_posedness():
     # ∂ppm/∂y_src ≈ 0 on the centreline → Fisher info for y is tiny).
     assert est.crb_std is not None
     assert est.crb_std["y"] > est.crb_std["x"] * 3
+    # F7 honesty flag: a near-singular Fisher matrix (collinear sensors) must be
+    # surfaced as ill_posed, not just left for the caller to notice crb_std["y"] is
+    # huge -- this is the case the flag was calibrated against.
+    assert est.ill_posed is True
+
+
+def test_ill_posed_flag_is_scale_invariant():
+    # The Fisher matrix mixes units (∂ppm/∂x,y in ppm/m vs ∂ppm/∂Q in ppm/(g/s)),
+    # so a RAW condition number scales with Q and geometry, not just collinearity —
+    # the same layout would flip the flag when only the leak size changes. The flag
+    # must depend on geometry alone: scaling Q (and the noise with it, leaving
+    # SNR identical) may not change the verdict on either the good or the bad layout.
+    for scale in (1.0, 1000.0):
+        pts_bad = _truth_points((5.0, 0.0), 8.0 * scale, sensors=SENSORS_COLLINEAR,
+                                sigma=0.20 * scale)
+        est_bad = inversion.invert(SENSORS_COLLINEAR, pts_bad, WIND_U, WIND_DIR,
+                                   stability_class=STAB)
+        assert est_bad.ill_posed is True, f"collinear must stay flagged at Q×{scale}"
+        pts_good = _truth_points((5.0, -3.0), 6.0 * scale, sigma=0.20 * scale)
+        est_good = inversion.invert(SENSORS, pts_good, WIND_U, WIND_DIR,
+                                    stability_class=STAB)
+        assert est_good.ill_posed is False, f"fan must stay unflagged at Q×{scale}"
 
 
 # ── F7: a REALISTIC hard dataset, and the multi-snapshot fix ─────────────────
@@ -292,6 +348,12 @@ def test_f7_single_snapshot_is_under_determined():
     assert est.converged is True                 # silent failure, not a crash
     pos_err = float(np.hypot(est.x - TRUE_SRC_F7[0], est.y - TRUE_SRC_F7[1]))
     assert pos_err > 15.0                         # confidently wrong from one snapshot
+    # The ill_posed flag (condition_number-based) does NOT catch this residual: the
+    # CRB is locally tight at the (wrong) basin the optimizer landed in -- this is
+    # exactly the "optimistic CRB" CLAUDE.md describes, a GLOBAL multi-modality
+    # problem invisible to a LOCAL Fisher-conditioning check. Asserted explicitly so
+    # this known gap can't be silently "fixed" by accident without deliberate review.
+    assert est.ill_posed is False
 
 
 def test_f7_multi_snapshot_fusion_recovers_source():
@@ -311,6 +373,7 @@ def test_f7_multi_snapshot_fusion_recovers_source():
     pos_err = float(np.hypot(fused.x - TRUE_SRC_F7[0], fused.y - TRUE_SRC_F7[1]))
     assert pos_err < 5.0                          # vs > 15 m single-snapshot (above)
     assert fused.Q == pytest.approx(Q_F7, rel=0.2)
+    assert fused.ill_posed is False               # well-posed control case for the flag
 
 
 def test_f7_multi_snapshot_crb_tightens():

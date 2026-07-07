@@ -38,7 +38,9 @@ from ui.explain import (
     interpret_fieldtest,
     summarize_fieldtest,
 )
-from physics.plume import CH4_BACKGROUND
+from physics.accuracy import accuracy_report
+from physics.inversion import invert_field_tests_multi
+from physics.plume import CH4_BACKGROUND, U_MIN
 from physics.sensor_sim import DETECT_K, SENSOR_NOISE_PPM
 
 # Detection-limit line on the plot: background + 3σ noise = 2.80 ppm. Same number
@@ -204,34 +206,54 @@ def _enrich_meta_with_weather(meta: dict) -> dict | None:
 
 
 def _store_readings(ft_id: int, parsed: dict) -> None:
-    """Persist parsed CSV arrays as raw reading rows."""
+    """Persist parsed CSV arrays as raw reading rows.
+
+    Temperature/humidity gaps arrive as NaN (parse_csv reports reality, it never
+    invents values) and are stored as NULL — so a re-read rebuilds the same gappy
+    column and process_fieldtest applies the one gap policy everywhere."""
     n = parsed["n"]
     time, temp, humid, ppm = (parsed["time"], parsed["temperature"],
                               parsed["humidity"], parsed["ppm"])
+
+    def cell(col, i):
+        if col is None or not np.isfinite(col[i]):
+            return None
+        return float(col[i])
+
     rows = [
         (i,
-         float(time[i]) if time is not None else None,
+         cell(time, i),
          float(ppm[i]),
-         float(temp[i]) if temp is not None else None,
-         float(humid[i]) if humid is not None else None)
+         cell(temp, i),
+         cell(humid, i))
         for i in range(n)
     ]
     db.add_readings(ft_id, rows)
 
 
 def _stored_arrays(ft: dict):
-    """Load a stored test's readings as numpy arrays (None columns stay None)."""
+    """Load a stored test's readings as numpy arrays (None columns stay None).
+
+    The clock must be complete to be trusted (same rule as parse_csv);
+    temperature/humidity NULLs come back as NaN so process_fieldtest's gap
+    policy treats a stored test exactly like a fresh upload."""
     readings = db.get_readings(ft["id"])
     if not readings:
         return None
     ppm = np.array([r["ppm_raw"] for r in readings], dtype=float)
 
-    def col(key):
+    def full_col(key):
         vals = [r[key] for r in readings]
         return np.array(vals, dtype=float) if all(v is not None for v in vals) else None
 
-    return {"ppm": ppm, "time": col("t_seconds"),
-            "temperature": col("temperature"), "humidity": col("humidity")}
+    def gappy_col(key):
+        vals = [r[key] for r in readings]
+        if all(v is None for v in vals):
+            return None
+        return np.array([v if v is not None else np.nan for v in vals], dtype=float)
+
+    return {"ppm": ppm, "time": full_col("t_seconds"),
+            "temperature": gappy_col("temperature"), "humidity": gappy_col("humidity")}
 
 
 def _process_stored(ft: dict):
@@ -354,8 +376,13 @@ def api_fieldtests_create():
     _store_readings(ft_id, parsed)
     ft = db.get_field_test(ft_id)
     result = _process_stored(ft)
+    # Parse-time flags (skipped rows, sorted clock) exist only now — the raw CSV
+    # isn't stored — so they ride the create response; process-level flags are
+    # recomputed from storage on every read (see api_fieldtest_detail).
     return jsonify({"id": ft_id, "meta": ft, "facts": summarize_fieldtest(result, ft),
                     "series": _series_json(result), "columns": parsed["columns"],
+                    "warnings": parsed["warnings"] + result["warnings"],
+                    "accuracy": accuracy_report(result, meta=ft),
                     "weather": (wx.source if wx else None),
                     "weather_error": (None if wx else weather.LAST_WEATHER_ERROR)}), 201
 
@@ -380,7 +407,9 @@ def api_fieldtests_sample():
     ft = db.get_field_test(ft_id)
     result = _process_stored(ft)
     return jsonify({"id": ft_id, "meta": ft, "facts": summarize_fieldtest(result, ft),
-                    "series": _series_json(result)}), 201
+                    "series": _series_json(result),
+                    "warnings": result["warnings"],
+                    "accuracy": accuracy_report(result, meta=ft)}), 201
 
 
 @app.route("/api/fieldtests/compare")
@@ -402,18 +431,113 @@ def api_fieldtests_compare():
     return jsonify({"tests": tests, "spread": _spread(facts_list)})
 
 
+@app.route("/api/fieldtests/invert", methods=["POST"])
+def api_fieldtests_invert():
+    """
+    Fuse 2+ selected field tests into one recovered source (x, y, Q).
+
+    MVP framing: the DB stores one sensor_distance_m scalar, not a per-test sensor
+    (x, y) — so this treats every selected test as one Snapshot recorded at the
+    SAME fixed sensor (the map origin), under different wind episodes. That matches
+    invert_multi's actual documented use case (triangulating a steady leak from
+    several wind directions at one mounting point), not simultaneous multi-sensor
+    triangulation, which would need new schema this single-Arduino-rig deployment
+    doesn't need. Body: {"ids": [1, 2, 3]}.
+    """
+    _ensure_schema()
+    body = request.get_json(silent=True) or {}
+    ids = []
+    for raw in (body.get("ids") or []):
+        try:
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            pass
+    if len(ids) < 2:
+        return jsonify({"error": "select at least 2 field tests (same sensor, "
+                                "different wind episodes) to fuse"}), 400
+
+    snaps, distances = [], []
+    for ft_id in ids:
+        ft = db.get_field_test(ft_id)
+        if ft is None:
+            return jsonify({"error": f"field test {ft_id} not found"}), 404
+        result = _process_stored(ft)
+        if result is None:
+            return jsonify({"error": f"field test {ft_id} has no readings"}), 400
+        u, wind_dir = ft.get("wind_speed"), ft.get("wind_dir_deg")
+        if u is None or wind_dir is None:
+            return jsonify({"error": f"field test {ft_id} ('{ft.get('name')}') has "
+                                    "no wind speed/direction set"}), 400
+        if float(u) < U_MIN:
+            return jsonify({"error": f"field test {ft_id} wind speed {u} m/s is "
+                                    f"below the model minimum {U_MIN} m/s"}), 400
+        snaps.append(([result], float(u), float(wind_dir), ft.get("stability_class")))
+        distances.append((ft_id, ft.get("name"), ft.get("sensor_distance_m")))
+
+    # Enforce the endpoint's own premise: one fixed sensor. Tests recorded at
+    # different stored standoffs are different geometries — fusing them as
+    # co-located would return a confidently-wrong fix.
+    known = [(i, n, float(d)) for (i, n, d) in distances if d is not None]
+    if known:
+        d0 = known[0][2]
+        if any(abs(d - d0) > 0.5 for (_, _, d) in known):
+            listing = ", ".join(f"{n or i}: {d:g} m" for (i, n, d) in known)
+            return jsonify({"error": "selected tests disagree on sensor_distance_m "
+                                     f"({listing}) — fusion assumes the SAME fixed "
+                                     "sensor across all wind episodes"}), 400
+
+    try:
+        est = invert_field_tests_multi(snaps, [[0.0, 0.0]])
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+
+    return jsonify({
+        "x": est.x, "y": est.y, "Q": est.Q, "stability_class": est.stability_class,
+        "u": est.u, "wind_dir_deg": est.wind_dir_deg, "converged": est.converged,
+        "ill_posed": est.ill_posed, "crb_std": est.crb_std,
+        "n_snapshots": est.n_snapshots, "rmse_ppm": est.rmse_ppm, "note": est.note,
+        "assumption": "Source (x, y) is reported relative to one fixed sensor (the "
+                     "map origin), fusing the selected tests as different wind "
+                     "episodes at that SAME sensor -- not simultaneous multi-sensor "
+                     "triangulation.",
+    })
+
+
 @app.route("/api/fieldtests/<int:ft_id>")
 def api_fieldtest_detail(ft_id):
-    """One test's metadata + full processed series + facts."""
+    """One test's metadata + full processed series + facts + accuracy report.
+
+    The accuracy report rides along (instead of a second round-trip to
+    /accuracy) so viewing a test runs the cleaning pipeline ONCE, not twice."""
     _ensure_schema()
     ft = db.get_field_test(ft_id)
     if ft is None:
         return jsonify({"error": "field test not found"}), 404
     result = _process_stored(ft)
     if result is None:
-        return jsonify({"meta": ft, "facts": _empty_facts(ft), "series": None})
+        return jsonify({"meta": ft, "facts": _empty_facts(ft), "series": None,
+                        "warnings": [], "accuracy": None})
     return jsonify({"meta": ft, "facts": summarize_fieldtest(result, ft),
-                    "series": _series_json(result)})
+                    "series": _series_json(result),
+                    "warnings": result["warnings"],
+                    "accuracy": accuracy_report(result, meta=ft)})
+
+
+@app.route("/api/fieldtests/<int:ft_id>/accuracy")
+def api_fieldtest_accuracy(ft_id):
+    """The Accuracy Protocol for one test: measured noise floor (vs the assumed
+    placeholder), detection limit + error bar, 0-100 grade, and a recommendation.
+    Reuses accuracy.accuracy_report unchanged — no new physics here. (The UI reads
+    the copy embedded in the detail/create responses; this stands alone for API
+    users and scripts.)"""
+    _ensure_schema()
+    ft = db.get_field_test(ft_id)
+    if ft is None:
+        return jsonify({"error": "field test not found"}), 404
+    result = _process_stored(ft)
+    if result is None:
+        return jsonify({"error": "no readings to assess"}), 400
+    return jsonify(accuracy_report(result, meta=ft))
 
 
 @app.route("/api/fieldtests/<int:ft_id>/interpret", methods=["POST"])

@@ -73,6 +73,45 @@ from physics.fieldtest import InversionPoint, aggregate_for_inversion
 from physics.accuracy import crb_source_bound_multi
 from physics.sensor_sim import DETECT_K, effective_noise_floor
 
+# F7 honesty flag — two DETECTORS, both dimensionless (a raw cond(F) mixes units,
+# ppm/m vs ppm/(g/s), so it scales with Q/sensor spacing and any fixed threshold
+# on it flips when only the leak size changes):
+#   1. accuracy's correlation-normalized Fisher cond > this threshold — catches
+#      rank deficiency / global parameter trade-offs (e.g. 1 sensor × 2 winds =
+#      2 measurements for 3 unknowns → cond ~4e16). Well-posed layouts measure
+#      ≤ ~3e4; 1e7 separates with orders of margin on both sides.
+#   2. _wind_collinear_blind — the collinear-sensors REFLECTION ambiguity: every
+#      sensor on one wind-parallel line makes the crosswind source coordinate
+#      sign-ambiguous (two mirror basins). A local Fisher analysis cannot see a
+#      global two-basin symmetry (at the fitted point the CRB looks tight), so
+#      this one is detected from the geometry itself.
+# NOTE: neither catches the separate F7 single-wind soft-direction residual, whose
+# CRB is honestly wide rather than degenerate — that is cured by invert_multi
+# (more snapshots), not by a flag (see CLAUDE.md F7).
+_CRB_ILL_POSED_COND_THRESHOLD = 1e7
+
+
+def _wind_collinear_blind(sensors_xy, snaps) -> bool:
+    """True when every sensor lies on one wind-parallel line in a SHARED wind frame.
+
+    Reflecting the source about that line leaves every downwind/crosswind distance
+    unchanged, so (x, y) is only determined up to a mirror image — ill-posed no
+    matter how tight the local CRB looks. Snapshots with genuinely different wind
+    directions have different mirror lines, so fusion breaks the symmetry: the
+    check only applies when all snapshots share (nearly) one direction.
+    """
+    dirs = [float(s.wind_dir_deg) % 360.0 for s in snaps]
+    if max(dirs) - min(dirs) > 1.0:            # distinct winds → no shared mirror
+        return False
+    phi = np.radians(dirs[0])
+    xy = np.asarray(sensors_xy, dtype=float)
+    downwind = xy[:, 0] * (-np.sin(phi)) + xy[:, 1] * (-np.cos(phi))
+    crosswind = xy[:, 0] * np.cos(phi) + xy[:, 1] * (-np.sin(phi))
+    span_down = float(np.ptp(downwind))
+    if span_down <= 0.0:                       # single sensor / fully degenerate
+        return True
+    return float(np.ptp(crosswind)) < 0.01 * span_down
+
 
 @dataclass
 class SourceEstimate:
@@ -80,7 +119,8 @@ class SourceEstimate:
     The recovered leak. ``x``/``y`` are map coordinates (m, East/North), ``Q`` is
     the emission rate (g/s). ``crb_std`` is the theoretical best-possible 1σ on each
     parameter — compare your run-to-run scatter against it to know if the fit is as
-    tight as the physics permits.
+    tight as the physics permits. ``ill_posed`` flags a near-singular Fisher matrix
+    (e.g. collinear sensors) — see ``_CRB_ILL_POSED_COND_THRESHOLD``.
     """
     x: float                  # source East coordinate (m, map frame)
     y: float                  # source North coordinate (m, map frame)
@@ -97,6 +137,7 @@ class SourceEstimate:
     converged: bool           # False when the signal is too weak to localise
     note: str                 # short provenance / caveat
     n_snapshots: int = 1      # how many wind-snapshots were fused (1 = single)
+    ill_posed: bool = False   # True when the CRB's Fisher matrix is near-singular
 
 
 @dataclass
@@ -427,6 +468,7 @@ def invert_multi(
     cls = int(best_snaps[0].stability)
 
     crb_std = None
+    ill_posed = False
     note = f"shrinking-grid WLS; Q closed-form (linear-in-Q); {K} snapshot(s)"
     if not converged:
         note = "no sensor shows signal above 3σ — Q≈0, position unconstrained (upper-bound only)"
@@ -440,9 +482,18 @@ def invert_multi(
             try:
                 views = [(s.u, s.wind_dir_deg, int(s.stability)) for s in best_snaps]
                 crb = crb_source_bound_multi(src_pos=(x, y), Q=Q, views=views, H=H,
-                                             receptors=sensors_xy, sigma_ppm=sigma_rep)
+                                             receptors=sensors_xy, sigma_ppm=sigma_rep,
+                                             T_K=T_K, P_Pa=P_Pa)
                 crb_std = crb.std
+                degenerate = crb.condition_number > _CRB_ILL_POSED_COND_THRESHOLD
+                mirror = _wind_collinear_blind(sensors_xy, best_snaps)
+                ill_posed = degenerate or mirror
                 note += f"; CRB at σ≈{sigma_rep:.2f} ppm ({crb.note})"
+                if degenerate:
+                    note += "; Fisher matrix near-singular (too few independent measurements)"
+                if mirror:
+                    note += ("; sensors collinear along the wind — crosswind position "
+                             "is mirror-ambiguous")
             except Exception as exc:             # never let the referee crash the fit
                 note += f"; CRB unavailable ({type(exc).__name__})"
 
@@ -451,7 +502,23 @@ def invert_multi(
         wind_dir_deg=float(best_snaps[0].wind_dir_deg), cost=cost, rmse_ppm=rmse,
         residuals_ppm=[float(r) for r in resid], n_sensors=n,
         crb_std=crb_std, converged=converged, note=note, n_snapshots=K,
+        ill_posed=ill_posed,
     )
+
+
+def _default_t_k_from_points(kwargs: dict, points) -> None:
+    """Default kwargs["T_K"] to the mean CSV-measured temperature (K) of the
+    InversionPoints that logged one — shared by both field-test entry points so
+    the rule can't drift between them. No point carries a temperature (no CSV
+    temperature column) → leave kwargs alone and let predict_ppm's
+    standard-atmosphere default apply, rather than inventing a value. An explicit
+    caller-passed T_K always wins."""
+    if "T_K" in kwargs:
+        return
+    temps_c = [p.mean_temperature_c for p in points
+               if p.mean_temperature_c is not None]
+    if temps_c:
+        kwargs["T_K"] = float(np.mean(temps_c)) + 273.15
 
 
 def invert_field_tests(
@@ -469,8 +536,13 @@ def invert_field_tests(
     aggregates each one (aggregate_for_inversion → the time-mean + σ-of-the-mean) and
     forwards the InversionPoints to ``invert``. This is the call a deployment makes:
     upload N sensors' CSVs → process each → invert_field_tests → done.
+
+    T_K defaults to the mean of the sensors' own CSV-measured temperature (when any
+    test logged one) rather than predict_ppm's 20°C default — pass ``T_K=`` explicitly
+    to override.
     """
     pts = [aggregate_for_inversion(r, window_s=window_s) for r in results]
+    _default_t_k_from_points(kwargs, pts)
     return invert(sensor_positions, pts, u, wind_dir_deg, **kwargs)
 
 
@@ -489,12 +561,17 @@ def invert_field_tests_multi(
     stability_class)``, where ``results`` is the per-sensor list of process_fieldtest
     dicts captured under that wind. Each is aggregated (aggregate_for_inversion) and the
     snapshots are fused by ``invert_multi`` — triangulating the source (CLAUDE.md F7).
+
+    T_K defaults to the mean CSV-measured temperature across every fused point (see
+    ``invert_field_tests``); pass ``T_K=`` to override.
     """
-    snaps = []
+    snaps, all_pts = [], []
     for snap in snapshots:
         results, u, wind_dir = snap[0], snap[1], snap[2]
         stability = snap[3] if len(snap) > 3 else None
         pts = [aggregate_for_inversion(r, window_s=window_s) for r in results]
+        all_pts.extend(pts)
         snaps.append(Snapshot(points=pts, u=u, wind_dir_deg=wind_dir,
                               stability_class=stability))
+    _default_t_k_from_points(kwargs, all_pts)
     return invert_multi(sensor_positions, snaps, **kwargs)

@@ -530,6 +530,16 @@ body > *:not(.ambient) { position: relative; z-index: 1; }
 .dot--ok { background: var(--green); }
 .dot--no { background: var(--ink-faint); }
 
+/* ─── Data-quality warnings ───────────────────────────────────────────────── */
+.warn-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.warn-list li {
+  font-size: 12px; color: var(--ink-dim); padding: 7px 10px 7px 26px; position: relative;
+  border: 1px solid var(--line-soft); border-left: 3px solid var(--amber);
+  border-radius: 6px; background: var(--bg);
+}
+.warn-list li::before { content: '!'; position: absolute; left: 10px; color: var(--amber);
+                        font-family: var(--mono); font-weight: 700; }
+
 /* ─── Explainer ("How it works") page ─────────────────────────────────────── */
 .doc { width: min(1100px, calc(100% - 40px)); margin: 16px auto 0; display: grid; gap: var(--gap); }
 .doc__lede { margin: 2px 0 4px; font-size: 15px; line-height: 1.7; color: var(--ink-dim); }

@@ -162,11 +162,33 @@
         </article>
       </section>
 
+      <!-- data-quality warnings (skipped rows, unit mismatch, interpolated gaps…) -->
+      <section class="panel panel--warnings" id="warnPanel" style="--d:2" hidden>
+        <div class="panel__head"><span class="panel__label">DATA WARNINGS</span>
+          <span class="panel__sub">the pipeline changed or flagged something — check before trusting</span></div>
+        <ul class="warn-list" id="warnList"></ul>
+      </section>
+
+      <!-- accuracy report (shown alongside single-test metrics) -->
+      <section class="panel panel--accuracy" id="accuracyPanel" style="--d:2" hidden>
+        <div class="panel__head"><span class="panel__label">ACCURACY</span>
+          <span class="panel__sub" id="accuracyGrade">—</span></div>
+        <div class="spread" id="accuracyBody">—</div>
+      </section>
+
       <!-- compare spread table (shown only in compare mode) -->
       <section class="panel panel--spread" id="spreadPanel" style="--d:2" hidden>
         <div class="panel__head"><span class="panel__label">VARIANCE ACROSS TESTS</span>
           <span class="panel__sub">how repeatable are these runs?</span></div>
         <div class="spread" id="spreadBody"></div>
+      </section>
+
+      <!-- multi-snapshot inversion result (shown only after Invert is run) -->
+      <section class="panel panel--invert" id="invertPanel" style="--d:2" hidden>
+        <div class="panel__head"><span class="panel__label">RECOVERED SOURCE</span>
+          <span class="panel__sub">fused from selected tests — same sensor, different winds</span></div>
+        <div class="spread" id="invertBody"></div>
+        <p class="caption" id="invertAssumption"></p>
       </section>
     </div>
 
@@ -176,6 +198,7 @@
         <div class="panel__head">
           <span class="panel__label">SAVED TESTS</span>
           <button class="btn btn--compare" id="compareBtn" type="button" disabled>Compare (0)</button>
+          <button class="btn btn--compare" id="invertBtn" type="button" disabled title="Fuse selected tests as wind episodes at the SAME sensor into a recovered source">Invert (0)</button>
         </div>
         <div class="testlist" id="testList" aria-live="polite">
           <p class="testlist__empty">Loading…</p>

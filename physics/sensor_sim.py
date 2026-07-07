@@ -96,6 +96,7 @@ def effective_noise_floor(
     random_ppm: float = SENSOR_NOISE_PPM,
     bias_ppm: float = BIAS_FLOOR_PPM,
     n_avg: int = 1,
+    rho: float = 0.0,
 ) -> float:
     """
     Realistic detection floor (ppm, 1σ) after averaging ``n_avg`` samples.
@@ -123,12 +124,23 @@ def effective_noise_floor(
     (b) ``fieldtest.aggregate_for_inversion`` — the σ OF THE MEAN that weights one
     sensor's averaged reading in the Week-3 inversion. Both are the same quadrature;
     note neither is "pre-smooth then fit" — see CLAUDE.md "two averaging roles".
+
+    ``rho`` (F6): lag-1 autocorrelation of the random part. Correlated samples
+    carry less independent information, so the √N win is over an AR(1) *effective*
+    sample size ``n_eff = n_avg·(1−ρ)/(1+ρ)`` (floored at 1) instead of the raw
+    count. ρ=0 is the i.i.d. case (unchanged behaviour); pass a MEASURED ρ̂
+    (``accuracy.estimate_lag1_autocorrelation``), never a guess. Living here —
+    next to the √N it corrects — keeps "how noise averages" a single story for
+    every caller rather than a per-caller patch.
     """
     if n_avg < 1:
         raise ValueError(f"n_avg must be ≥ 1, got {n_avg}")
     if random_ppm < 0 or bias_ppm < 0:
         raise ValueError("noise terms must be non-negative")
-    random_part = random_ppm / np.sqrt(n_avg)
+    if not 0.0 <= rho < 1.0:
+        raise ValueError(f"rho must be in [0, 1), got {rho}")
+    n_eff = max(1.0, n_avg * (1.0 - rho) / (1.0 + rho))
+    random_part = random_ppm / np.sqrt(n_eff)
     return float(np.hypot(random_part, bias_ppm))
 
 

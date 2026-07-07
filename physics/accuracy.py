@@ -47,7 +47,7 @@ from physics.sensor_sim import (
     effective_noise_floor,
 )
 from physics import feasibility
-from physics.plume import predict_ppm
+from physics.plume import U_MIN, predict_ppm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -80,6 +80,31 @@ class NoiseEstimate:
     method: str          # short description of how it was measured
 
 
+_FALLBACK_NOTE = "whole record (too little quiet data)"
+
+
+def _quiet_samples(x: np.ndarray, detection: Detection | None, guard: int):
+    """The no-event part of a record (padded by ``guard``), or the whole record
+    when too little quiet data remains. Shared by estimate_noise_floor and
+    estimate_lag1_autocorrelation so both measure noise from the SAME samples.
+
+    Returns (quiet_samples, note); note == _FALLBACK_NOTE marks the fallback.
+    """
+    n = x.size
+    quiet = np.ones(n, dtype=bool)
+    if detection is not None and detection.detected and detection.start_idx >= 0:
+        lo = max(0, detection.start_idx - guard)
+        hi = min(n, detection.end_idx + guard)
+        quiet[lo:hi] = False
+
+    q = x[quiet]
+    note = "all samples" if q.size == n else "no-event samples"
+    if q.size < 8:                       # too little quiet data → use everything
+        q = x
+        note = _FALLBACK_NOTE
+    return q, note
+
+
 def estimate_noise_floor(
     excess_unsmoothed,
     detection: Detection | None = None,
@@ -108,19 +133,7 @@ def estimate_noise_floor(
     Returns a NoiseEstimate.
     """
     x = np.asarray(excess_unsmoothed, dtype=float)
-    n = x.size
-
-    quiet = np.ones(n, dtype=bool)
-    if detection is not None and detection.detected and detection.start_idx >= 0:
-        lo = max(0, detection.start_idx - guard)
-        hi = min(n, detection.end_idx + guard)
-        quiet[lo:hi] = False
-
-    q = x[quiet]
-    note = "all samples" if q.size == n else "no-event samples"
-    if q.size < 8:                       # too little quiet data → use everything
-        q = x
-        note = "whole record (too little quiet data)"
+    q, note = _quiet_samples(x, detection, guard)
 
     # random: robust σ from successive differences (immune to slow drift).
     if q.size >= 2:
@@ -141,6 +154,52 @@ def estimate_noise_floor(
         n_quiet=int(q.size),
         method=f"successive-diff random + slow-residual bias ({note})",
     )
+
+
+def estimate_lag1_autocorrelation(
+    excess_unsmoothed,
+    detection: Detection | None = None,
+    guard: int = 5,
+) -> float:
+    """
+    Measure the quiet record's lag-1 autocorrelation ρ̂ (F6 fix).
+
+    MOX baseline wander is often strongly autocorrelated (ρ≈0.8-0.95), not i.i.d.
+    Treating it as i.i.d. underestimates the σ of a window MEAN — √N shrinks faster
+    than a correlated series actually allows — which is what let strongly
+    autocorrelated noise fabricate a source (F6) and left the inversion's reported
+    σ over-confident. This is measured directly from THIS record's own quiet
+    samples (never assumed/guessed — the prior objection to a fixed/guessed AR(1)
+    model does not apply to a per-record empirical ρ̂).
+
+    Computed on the RAW quiet excess (not the successive-difference series
+    ``estimate_noise_floor`` uses for its random-noise estimate — differencing
+    deliberately cancels the very correlation structure ρ̂ needs to see).
+
+    Returns ρ̂ clipped to [0.0, 0.99]: negative/no correlation needs no inflation
+    (floored at 0), and 0.99 keeps the AR(1) effective-N formula
+    (``n_eff = n·(1-ρ̂)/(1+ρ̂)``) from dividing by ~zero.
+
+    Event-dominated records: when a detection leaves too little quiet data,
+    ``_quiet_samples`` falls back to the WHOLE record — fine for the noise floor
+    (differencing cancels the event's slow shape) but poison here: corrcoef of a
+    smooth plume bump is ~0.98, which would floor n_eff at 1 and collapse the
+    strongest sensor's WLS weight. With no trustworthy quiet stretch the honest
+    answer is 0.0 (no correction), not a ρ̂ of the plume itself.
+    """
+    x = np.asarray(excess_unsmoothed, dtype=float)
+    q, note = _quiet_samples(x, detection, guard)
+    if note == _FALLBACK_NOTE and detection is not None and detection.detected:
+        return 0.0
+    if q.size < 3:
+        return 0.0
+    a, b = q[:-1], q[1:]
+    if np.std(a) < 1e-12 or np.std(b) < 1e-12:
+        return 0.0
+    rho = float(np.corrcoef(a, b)[0, 1])
+    if not np.isfinite(rho):
+        return 0.0
+    return float(np.clip(rho, 0.0, 0.99))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -249,6 +308,7 @@ def detection_limit(
     stability: int = 4,
     n_avg: int = 1,
     n_avg_curve=(1, 4, 16, 64, 256),
+    rho: float = 0.0,
 ) -> DetectionLimit:
     """
     Best-achievable detection NOW, from a measured/assumed floor (Protocol 4a).
@@ -257,8 +317,13 @@ def detection_limit(
     reusing the feasibility back-solver (the plume is linear in Q). Reports it at
     the nominal (u, stability) plus the wind/stability error bar, and traces how
     averaging lowers the limit until the non-averageable bias takes over.
+
+    ``rho`` (F6): measured lag-1 autocorrelation of the record's noise. Correlated
+    samples average slower than √N, so the "how low can averaging take the floor"
+    curve would over-promise on a real MOX record if computed i.i.d. Pass the
+    record's own ρ̂ (``accuracy_report`` does); 0 keeps the i.i.d. story.
     """
-    floor = effective_noise_floor(random_ppm, bias_ppm, n_avg)
+    floor = effective_noise_floor(random_ppm, bias_ppm, n_avg, rho=rho)
     lod = k * floor
     loq = 10.0 * floor
 
@@ -277,7 +342,7 @@ def detection_limit(
 
     curve = []
     for nv in n_avg_curve:
-        f = effective_noise_floor(random_ppm, bias_ppm, nv)
+        f = effective_noise_floor(random_ppm, bias_ppm, nv, rho=rho)
         l = k * f
         mq = float(l / per_unit_Q) if per_unit_Q > 1e-12 else float("inf")
         curve.append({"n": int(nv), "floor_ppm": float(f),
@@ -341,9 +406,16 @@ def accuracy_report(result: dict, meta: dict | None = None,
     snr = float(excess_peak / meas_floor) if meas_floor > 0 else 0.0
     confidence = float(det.confidence)
 
-    # (4a) Detection limit from the MEASURED floor at this geometry.
-    dl = detection_limit(ne.random_ppm, ne.bias_ppm, distance=distance,
-                         u=u, stability=stability)
+    # (4a) Detection limit from the MEASURED floor at this geometry. Below U_MIN
+    # the plume model is undefined (calm-wind caveat, CLAUDE.md) — report no
+    # limit rather than crash the report or silently clamp the physics. The
+    # record's own measured ρ̂ rides along so the averaging curve doesn't
+    # over-promise on correlated noise (F6).
+    dl = None
+    if u >= U_MIN:
+        rho_hat = estimate_lag1_autocorrelation(raw - baseline, det)
+        dl = detection_limit(ne.random_ppm, ne.bias_ppm, distance=distance,
+                             u=u, stability=stability, rho=rho_hat)
 
     # (2) Recovery vs known truth (synthetic only).
     recovery = None
@@ -371,7 +443,7 @@ def accuracy_report(result: dict, meta: dict | None = None,
             "Bias-limited: the non-averageable drift dominates — recalibrate or "
             "run zero-air; averaging past N≈"
             f"{dl.crossover_n:.0f} buys almost nothing."
-            if dl.crossover_n is not None else
+            if dl is not None and dl.crossover_n is not None else
             "Bias-limited: recalibrate the sensor; averaging will not help."
         )
     elif conf < DETECT_K:
@@ -382,6 +454,10 @@ def accuracy_report(result: dict, meta: dict | None = None,
                    "lower the smallest detectable leak.")
     else:
         rec_msg = "Signal-rich: a comfortable detection margin at this geometry."
+    if dl is None:
+        rec_msg = (f"Calm wind (u={u:g} m/s is below the {U_MIN:g} m/s model "
+                   "minimum): the plume model is undefined, so no detection "
+                   "limit is reported for this geometry. " + rec_msg)
 
     return {
         "assumed_floor_ppm": assumed_floor,
@@ -394,7 +470,7 @@ def accuracy_report(result: dict, meta: dict | None = None,
         "snr": snr,
         "confidence_sigmas": confidence,
         "detected": bool(det.detected),
-        "detection_limit": asdict(dl),
+        "detection_limit": asdict(dl) if dl is not None else None,
         "recovery": recovery,
         "score": round(score, 1),
         "grade": _grade_letter(score),
@@ -424,11 +500,15 @@ class CRBound:
 
 
 def _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class, receptors,
-                     params=("x", "y", "Q"), rel_step: float = 1e-3):
+                     params=("x", "y", "Q"), rel_step: float = 1e-3,
+                     T_K: float = 293.15, P_Pa: float = 101325.0):
     """Central-difference Jacobian: column j = ∂(ppm at receptors)/∂param_j.
 
     clamp_to_table=True so a probe at the box edge never raises. Shared by the
     single- and multi-snapshot CRB so both measure sensitivity identically.
+    T_K/P_Pa must match whatever the fit being bounded actually used — otherwise
+    the CRB silently describes a different (default-atmosphere) forward model than
+    the one that produced the estimate it's supposed to bound.
     """
     receptors = np.asarray(receptors, dtype=float)
     base = {"x": float(src_pos[0]), "y": float(src_pos[1]), "Q": float(Q)}
@@ -437,7 +517,7 @@ def _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class, receptors,
         return predict_ppm(
             src_pos=(p["x"], p["y"]), Q=p["Q"], u=u, wind_dir_deg=wind_dir_deg,
             H=H, stability_class=stability_class, receptors=receptors,
-            clamp_to_table=True,
+            T_K=T_K, P_Pa=P_Pa, clamp_to_table=True,
         )
 
     cols = []
@@ -455,8 +535,25 @@ def _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class, receptors,
 
 
 def _crb_from_fisher(F, params, n_receptors, sigma_ppm) -> CRBound:
-    """Invert a Fisher information matrix into a CRBound (pinv fallback if singular)."""
-    cond = float(np.linalg.cond(F))
+    """Invert a Fisher information matrix into a CRBound (pinv fallback if singular).
+
+    ``condition_number`` is the cond of the correlation-NORMALIZED Fisher matrix
+    (D F D with D = diag(F)^-1/2), not of F itself: F's columns mix units (ppm/m
+    for x, y vs ppm/(g/s) for Q), so a raw cond(F) scales with Q and sensor
+    spacing and any fixed threshold on it would flip when only the leak size
+    changes. The normalized form is DIMENSIONLESS and catches global degeneracy —
+    parameter trade-offs and rank deficiency (fewer independent measurements than
+    parameters). It can NOT see the collinear-sensors reflection ambiguity (a
+    global two-basin symmetry invisible to any local Fisher analysis) — the
+    inversion detects that geometrically (``inversion._wind_collinear_blind``).
+    A non-positive diagonal (a parameter with no sensitivity at all) reports inf.
+    """
+    F = np.asarray(F, dtype=float)
+    d = np.sqrt(np.diag(F))
+    if np.any(d <= 0) or not np.all(np.isfinite(d)):
+        cond = float("inf")
+    else:
+        cond = float(np.linalg.cond(F / np.outer(d, d)))
     try:
         cov = np.linalg.inv(F)
         note = "ok"
@@ -482,6 +579,8 @@ def crb_source_bound(
     sigma_ppm: float,
     params=("x", "y", "Q"),
     rel_step: float = 1e-3,
+    T_K: float = 293.15,
+    P_Pa: float = 101325.0,
 ) -> CRBound:
     """
     Cramér-Rao lower bound on a source fix (Protocol 4b — the theoretical best).
@@ -513,7 +612,7 @@ def crb_source_bound(
     """
     receptors = np.asarray(receptors, dtype=float)
     J = _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class,
-                         receptors, params, rel_step)
+                         receptors, params, rel_step, T_K=T_K, P_Pa=P_Pa)
     F = J.T @ J / (sigma_ppm ** 2)                     # Fisher information
     return _crb_from_fisher(F, params, receptors.shape[0], sigma_ppm)
 
@@ -527,6 +626,8 @@ def crb_source_bound_multi(
     sigma_ppm: float,
     params=("x", "y", "Q"),
     rel_step: float = 1e-3,
+    T_K: float = 293.15,
+    P_Pa: float = 101325.0,
 ) -> CRBound:
     """
     Combined Cramér-Rao bound when the SAME source + sensors are seen under several
@@ -545,12 +646,13 @@ def crb_source_bound_multi(
     ----------
     views : list of (u, wind_dir_deg, stability_class) — one per snapshot, all sharing
             the same source, geometry (H, receptors) and Q.
+    T_K, P_Pa : must match what the fit being bounded used (see _source_jacobian).
     """
     receptors = np.asarray(receptors, dtype=float)
     p = len(params)
     F = np.zeros((p, p))
     for (u, wind_dir_deg, stability_class) in views:
         J = _source_jacobian(src_pos, Q, u, wind_dir_deg, H, stability_class,
-                             receptors, params, rel_step)
+                             receptors, params, rel_step, T_K=T_K, P_Pa=P_Pa)
         F += J.T @ J / (sigma_ppm ** 2)
     return _crb_from_fisher(F, params, receptors.shape[0], sigma_ppm)

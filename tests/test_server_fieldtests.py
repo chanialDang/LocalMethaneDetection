@@ -145,6 +145,105 @@ def test_compare_returns_spread(client):
     assert d["tests"][0]["series"] is not None
 
 
+# ─── accuracy report ──────────────────────────────────────────────────────────────
+def test_accuracy_endpoint_returns_grade_and_floor(client):
+    ft_id = _upload(client).get_json()["id"]
+    d = client.get(f"/api/fieldtests/{ft_id}/accuracy").get_json()
+    assert "grade" in d and "score" in d
+    assert d["assumed_floor_ppm"] == pytest.approx(0.30)
+    assert "recommendation" in d and isinstance(d["recommendation"], str)
+
+
+def test_accuracy_endpoint_404_for_missing_test(client):
+    assert client.get("/api/fieldtests/99999/accuracy").status_code == 404
+
+
+# ─── multi-snapshot inversion ─────────────────────────────────────────────────────
+def _upload_with_wind(client, wind_dir_deg, name="snap"):
+    return _upload(client, name=name, wind_speed="2.0",
+                   wind_dir_deg=str(wind_dir_deg), stability_class="4").get_json()["id"]
+
+
+def test_invert_endpoint_fuses_two_tests(client):
+    a = _upload_with_wind(client, 250.0, name="a")
+    b = _upload_with_wind(client, 290.0, name="b")
+    d = client.post("/api/fieldtests/invert", json={"ids": [a, b]}).get_json()
+    assert d["n_snapshots"] == 2
+    for key in ("x", "y", "Q", "converged", "ill_posed", "crb_std", "note", "assumption"):
+        assert key in d
+
+
+def test_invert_endpoint_requires_at_least_two_ids(client):
+    a = _upload_with_wind(client, 270.0)
+    resp = client.post("/api/fieldtests/invert", json={"ids": [a]})
+    assert resp.status_code == 400
+    assert "at least 2" in resp.get_json()["error"]
+
+
+def test_invert_endpoint_requires_wind_metadata(client):
+    a = _upload_with_wind(client, 270.0)
+    b = _upload(client, name="no-wind").get_json()["id"]   # no wind fields set
+    resp = client.post("/api/fieldtests/invert", json={"ids": [a, b]})
+    assert resp.status_code == 400
+    assert "wind" in resp.get_json()["error"]
+
+
+def test_invert_endpoint_rejects_calm_wind(client):
+    a = _upload_with_wind(client, 270.0)
+    b = _upload(client, name="calm", wind_speed="0.1", wind_dir_deg="270",
+               stability_class="4").get_json()["id"]
+    resp = client.post("/api/fieldtests/invert", json={"ids": [a, b]})
+    assert resp.status_code == 400
+    assert "below the model minimum" in resp.get_json()["error"]
+
+
+def test_invert_endpoint_404_for_missing_test(client):
+    a = _upload_with_wind(client, 270.0)
+    resp = client.post("/api/fieldtests/invert", json={"ids": [a, 99999]})
+    assert resp.status_code == 404
+
+
+def test_invert_endpoint_rejects_mismatched_sensor_distances(client):
+    # The endpoint's whole premise is "SAME fixed sensor, different winds" — tests
+    # recorded at different stored standoffs must be refused, not silently fused
+    # into a confidently-wrong source fix.
+    a = _upload(client, name="near", wind_speed="2.0", wind_dir_deg="250",
+                stability_class="4", sensor_distance_m="20").get_json()["id"]
+    b = _upload(client, name="far", wind_speed="2.0", wind_dir_deg="290",
+                stability_class="4", sensor_distance_m="80").get_json()["id"]
+    resp = client.post("/api/fieldtests/invert", json={"ids": [a, b]})
+    assert resp.status_code == 400
+    assert "sensor_distance_m" in resp.get_json()["error"]
+
+
+# ─── warnings must reach the user ────────────────────────────────────────────────
+def _messy_csv_bytes():
+    # Unsorted timestamps (parse-time flag) + implausibly large readings
+    # (process-time flag, recomputable from storage on every read).
+    return b"time,ppm\n5,20000\n1,30000\n3,40000\n" + \
+           b"".join(f"{i + 6},1.9\n".encode() for i in range(60))
+
+
+def test_upload_surfaces_parse_and_process_warnings(client):
+    data = {"name": "messy", "file": (io.BytesIO(_messy_csv_bytes()), "m.csv")}
+    resp = client.post("/api/fieldtests", data=data,
+                       content_type="multipart/form-data")
+    assert resp.status_code == 201
+    warnings = resp.get_json()["warnings"]
+    assert any("sorted by time" in w for w in warnings)      # parse-level
+    assert any("plausible" in w for w in warnings)           # process-level
+
+
+def test_detail_recomputes_process_warnings(client):
+    data = {"name": "messy2", "file": (io.BytesIO(_messy_csv_bytes()), "m.csv")}
+    ft_id = client.post("/api/fieldtests", data=data,
+                        content_type="multipart/form-data").get_json()["id"]
+    d = client.get(f"/api/fieldtests/{ft_id}").get_json()
+    # Parse-level flags are gone after upload (raw CSV isn't stored) but anything
+    # recomputable from the stored readings must re-surface on every read.
+    assert any("plausible" in w for w in d["warnings"])
+
+
 # ─── the existing model endpoints must still work ────────────────────────────────
 def test_model_field_endpoint_unaffected(client):
     assert client.get("/api/field").status_code == 200

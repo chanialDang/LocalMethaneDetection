@@ -13,6 +13,7 @@ Covers the Accuracy Protocol end to end on known-answer synthetic data:
 All synthetic, no network, no DB.
 """
 import numpy as np
+import pytest
 
 from physics import accuracy, feasibility
 from physics.fieldtest import make_sample_readings, process_fieldtest
@@ -48,6 +49,52 @@ def test_random_noise_tracks_injection():
     ne_lo = accuracy.estimate_noise_floor(lo["raw"] - lo["baseline"], lo["detection"])
     ne_hi = accuracy.estimate_noise_floor(hi["raw"] - hi["baseline"], hi["detection"])
     assert ne_hi.random_ppm > ne_lo.random_ppm
+
+
+# ── F6: empirically-measured (not guessed) lag-1 autocorrelation ────────────────
+def _ar1_series(rng, n, rho, sigma=0.30):
+    """Standard AR(1) construction: marginal variance stays sigma^2 regardless of
+    rho, so a test using this isolates autocorrelation from "more noise"."""
+    e = rng.normal(0, sigma * np.sqrt(1 - rho ** 2), size=n)
+    x = np.empty(n)
+    x[0] = e[0]
+    for i in range(1, n):
+        x[i] = rho * x[i - 1] + e[i]
+    return x
+
+
+def test_estimate_lag1_autocorrelation_recovers_known_rho():
+    # Independent expected value: the generating rho, not the estimator's own output.
+    rng = np.random.default_rng(7)
+    for true_rho in (0.0, 0.5, 0.8, 0.95):
+        x = _ar1_series(rng, 2000, true_rho)
+        rho_hat = accuracy.estimate_lag1_autocorrelation(x)
+        assert rho_hat == pytest.approx(true_rho, abs=0.07)
+
+
+def test_lag1_autocorrelation_refuses_event_dominated_record():
+    # When a detection covers so much of the record that _quiet_samples falls back
+    # to the WHOLE record, rho would be measured on the smooth plume bump itself
+    # (corrcoef of a bump ≈ 0.98) — actively wrong, and it collapses that sensor's
+    # WLS weight. With no trustworthy quiet stretch the function must return 0.0
+    # ("no correction"), the honest pre-F6 behaviour.
+    from physics.processing import detect_pattern
+    rng = np.random.default_rng(3)
+    n = 40
+    t = np.arange(n)
+    x = 6.0 * np.exp(-0.5 * ((t - 20) / 8.0) ** 2) + rng.normal(0, 0.3, n)
+    det = detect_pattern(x, noise_std=0.30)
+    # Precondition: the guard-padded event leaves < 8 quiet samples (the fallback).
+    n_quiet = max(0, det.start_idx - 5) + max(0, n - (det.end_idx + 5))
+    assert det.detected and n_quiet < 8
+    assert accuracy.estimate_lag1_autocorrelation(x, det) == 0.0
+
+
+def test_estimate_lag1_autocorrelation_is_clipped_nonnegative():
+    rng = np.random.default_rng(11)
+    white = rng.normal(0, 0.3, size=500)
+    rho_hat = accuracy.estimate_lag1_autocorrelation(white)
+    assert 0.0 <= rho_hat <= 0.99
 
 
 # ── 2. VALIDATE ──────────────────────────────────────────────────────────────
@@ -118,6 +165,30 @@ def test_accuracy_report_grades_clean_above_noisy():
     for key in ("score", "grade", "recommendation", "detection_limit",
                 "measured_random_ppm", "measured_floor_ppm", "geometry"):
         assert key in clean
+
+
+def test_detection_limit_averaging_curve_respects_autocorrelation():
+    # F6 completion: with correlated noise (ρ=0.8), the "average N samples" curve
+    # must shrink by √n_eff = √(N·(1−ρ)/(1+ρ)), not √N — hand-calc: at N=64,
+    # n_eff = 64/9, so the floor is 3× higher than the i.i.d. story claims.
+    iid = accuracy.detection_limit(0.30, 0.0)
+    corr = accuracy.detection_limit(0.30, 0.0, rho=0.8)
+    f_iid = {c["n"]: c["floor_ppm"] for c in iid.curve}
+    f_corr = {c["n"]: c["floor_ppm"] for c in corr.curve}
+    assert f_iid[64] == pytest.approx(0.30 / 8.0)
+    assert f_corr[64] == pytest.approx(0.30 / np.sqrt(64.0 / 9.0))
+    assert f_corr[64] == pytest.approx(3.0 * f_iid[64])
+
+
+def test_accuracy_report_survives_calm_wind_metadata():
+    # A stored test with u below the 0.5 m/s model minimum used to crash the
+    # report (predict_ppm raises below U_MIN) — and with it the upload endpoint.
+    # The report must degrade honestly: no detection limit, reason stated.
+    meta = {"sensor_distance_m": 50.0, "wind_speed": 0.1, "stability_class": 4}
+    rep = accuracy.accuracy_report(_processed_sample(), meta)
+    assert rep["detection_limit"] is None
+    assert "calm wind" in rep["recommendation"].lower()
+    assert 0.0 <= rep["score"] <= 100.0
 
 
 def test_accuracy_report_without_meta_or_truth():

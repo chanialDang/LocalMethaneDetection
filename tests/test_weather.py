@@ -80,6 +80,51 @@ def test_pasquill_returns_valid_class_range():
             assert 1 <= c <= 6
 
 
+# ── F8: EPA-454/R-99-005 Table 6-7 "Key to the SRDT Method", p.6-15 ─────────────
+# Expected values below are taken directly from the cited EPA table, independent
+# of the code under test (NOT a re-pin of whatever this code happened to output).
+def test_pasquill_strong_vs_moderate_insolation_boundary_925_diverges_at_high_wind():
+    # EPA: >=925 W/m^2 is "strong", 675-925 is "moderate". At wind >=6 m/s, EPA
+    # Table 6-7 maps strong->C and moderate->D -- the two bands genuinely diverge
+    # here, so this is the boundary where a wrong cutoff is actually observable
+    # (lower wind bands map strong and moderate to the same letter).
+    u = 6.5
+    strong = weather.pasquill_class(u, 950.0, 0.0)     # clearly >= 925
+    moderate = weather.pasquill_class(u, 900.0, 0.0)   # 675 <= 900 < 925
+    assert strong == 3      # C
+    assert moderate == 4    # D
+    # Old (pre-fix) 700/350 cutoffs would have called 900 W/m^2 "strong" too,
+    # collapsing this distinction -- the divergence IS the regression guard.
+    assert strong != moderate
+
+
+def test_pasquill_near_neutral_below_175_is_always_class_d():
+    # EPA's 4th daytime band (<175 W/m^2) is near-neutral -> class D regardless
+    # of wind; this band was entirely absent before the fix.
+    for u in (0.5, 3.0, 7.0):
+        assert weather.pasquill_class(u, 100.0, 0.0) == 4   # D
+
+
+def test_pasquill_slight_insolation_band_175_to_675():
+    # EPA's "slight" daytime band (175-675 W/m^2) at a wind row where slight
+    # differs from moderate (2-3 m/s: moderate->B, slight->C per Table 6-7).
+    moderate = weather.pasquill_class(2.5, 700.0, 0.0)   # 675 <= 700 < 925: moderate
+    slight = weather.pasquill_class(2.5, 300.0, 0.0)     # 175 <= 300 < 675: slight
+    assert moderate == 2    # B
+    assert slight == 3      # C
+
+
+def test_pasquill_exact_boundary_values_are_inclusive():
+    # EPA Table 6-7 bands are >=-inclusive at the lower edge: exactly 925 is
+    # "strong", exactly 675 is "moderate", exactly 175 is "slight" (NOT the D
+    # band). Exercised at wind rows where adjacent bands map to different
+    # letters, so an off-by-one comparison is observable.
+    assert weather.pasquill_class(6.5, 925.0, 0.0) == 3   # strong → C at ≥6 m/s
+    assert weather.pasquill_class(2.5, 675.0, 0.0) == 2   # moderate → B at 2-3 m/s
+    assert weather.pasquill_class(2.5, 175.0, 0.0) == 3   # slight → C, not D
+    assert weather.pasquill_class(2.5, 174.9, 0.0) == 4   # just below → D
+
+
 # ── height adjustment ────────────────────────────────────────────────────────
 def test_height_adjust_lowers_wind_toward_ground():
     u10 = 5.0

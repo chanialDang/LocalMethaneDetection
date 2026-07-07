@@ -176,7 +176,8 @@ over a meander window + the σ-of-the-mean weight (NOT pre-smoothed — WLS aver
 stdlib `urllib`). `fetch_wind_archive` is the only networked call; `parse_archive` /
 `summarize_archive` / `pasquill_class` / `adjust_wind_to_height` are pure + fixture-tested.
 Log-law-adjusts 10 m wind toward the ~2 m release height. Offline-safe (None +
-`LAST_WEATHER_ERROR`). Pasquill cutoffs caveated — see Backlog F8.
+`LAST_WEATHER_ERROR`). Daytime Pasquill cutoffs match EPA Table 6-7 (closed F8);
+the night path still uses cloud cover instead of ΔT — a documented deviation.
 
 **`inversion.py` (Week 3)** — `invert(sensor_positions, points, u, wind_dir_deg,
 stability_class=None, …)` → `SourceEstimate(x, y, Q, …, crb_std, converged, n_snapshots)`.
@@ -310,19 +311,17 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   every detectability/accuracy number. Measure on a zero-air/clean-air bench run; then every
   limit, error bar, and grade re-computes automatically — no other change.
 - **F6 residual** (`inversion.py`) — strongly autocorrelated *background* (ρ≈0.8–0.95) still
-  fabricates a source ~40% (the detector fires on sustained wander), and `sigma_ppm` stays
-  ~2× overconfident → the CRB is optimistic when a real source IS present. Needs the real
-  Figaro noise autocorrelation before an effective-N correction (won't tune against a
-  guessed AR model). White-noise fabrication is already fixed (54% → 0%).
+  fabricates a source ~40% (the detector fires on sustained wander) — that fabrication-rate
+  residual remains open. The σ-overconfidence half is CLOSED (see F12): `sigma_ppm` now uses
+  the record's own measured ρ̂ via `effective_noise_floor(rho=)`; MC coverage 1.03–1.29×
+  (slightly conservative) at a 120-sample window across ρ 0–0.95. Remaining edge: SHORT
+  windows (~30 samples) at ρ≈0.9 still under-cover (~0.74×, vs 0.64× before the fix).
+  White-noise fabrication is already fixed (54% → 0%).
 - **F7 residual** (`inversion.py`) — a single-snapshot fit on an under-determined layout
   still reports `converged=True` with an optimistic CRB (false confidence). Cured
   *operationally* by fusion; deployment guidance: **fuse ≥2 winds, or place ≥3 sensors that
   all sit in the plume.** The honest-flag path (widen CRB / `converged=False`) was
   deprioritized in favour of the fusion fix.
-- **F8 numeric** (`weather.py`) — daytime Pasquill solar cutoffs `700/350` are biased too
-  *unstable* vs EPA-454/R-99-005 SRDT Table 6-7 (`925/675/175` + a `<175→D` near-neutral
-  band). Verified divergent; the numeric fix shifts the stability class at the real sites,
-  so it's a user-owned decision. Mitigated: the inversion tries all classes.
 - **📚 Cite** — Briggs σ validity sub-100 m at a cluttered site (order-of-magnitude only);
   roughness `DEFAULT_Z0 = 0.1` (open country; a built fenceline is 0.3–1.0 m → changes the
   wind-height adjustment and implied stability — pick a site-specific z0).
@@ -330,8 +329,9 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   mixing → may **over**-predict ppm; note the bias direction when reporting); the in-record
   bias proxy; the ~160× Q-swing until real wind pins u + class (so `weather.py` must actually
   be wired per real run, not left default).
-- **🔧 / enhance** — fixed 20 °C / 1 atm in `gm3_to_ppm_methane` (pass real T/P from
-  metadata; small but real); nonlinear T·H weather-correction term; sensor front-end model
+- **🔧 / enhance** — pressure still fixed at 1 atm in `gm3_to_ppm_methane` (temperature is
+  now wired: CSV T column → `aggregate_for_inversion.mean_temperature_c` → inversion + CRB
+  `T_K`; P_Pa remains default); nonlinear T·H weather-correction term; sensor front-end model
   (derive the noise floor from ADC bits / V_ref / R_L instead of assuming it); multi-source
   inversion (sum of plumes); document the over-amplification method (large load resistor +
   precision ADC — the experimental justification for the whole project).
@@ -354,13 +354,49 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
 - **F7** — single-wind ill-posedness cured by `invert_multi` multi-snapshot fusion
   (~28 m → ~0.3 m at 2 winds, ~0.5 m at 3). NOT an optimizer local-minimum — genuinely
   under-determined; the cure is more information, not cleverer post-processing.
-- **F8** — cutoffs verified divergent vs EPA SRDT; caveat + citation recorded in
-  `weather.py`. Numeric fix left open above.
+- **F8** — daytime Pasquill cutoffs fixed to EPA-454/R-99-005 Table 6-7: `925/675/175`
+  + the `<175→D` near-neutral band (was `700/350`, biased too unstable). Locked by
+  `test_pasquill_*boundary*` incl. exact-boundary inclusivity (≥925/≥675/≥175). NOTE:
+  CLAUDE.md had reserved this as a user-owned decision (it shifts the real-site class);
+  the change shipped in the 2026-06-30 working tree — flag to the user before Custer.
+  Night path (cloud-cover proxy for ΔT) unchanged and still a documented deviation.
 - **F9** — `summarize_archive` guarded against a direction-less archive (`direction is None`
   / all-NaN → default 0°).
 - **F10** — `temp_humidity_correct` drops a (near-)constant regressor before the fit and
   reports its coefficient as 0 (the min-norm `lstsq` had invented a phantom `b_humid=0.058`).
   The *corrected signal* was fine; the reported *coefficient* was the defect.
+- **F11** (2026-07-07 review) — weather-fit fabrication via interpolated T/H: a gap
+  spanning the plume event, filled by parse-time interpolation, fed the WHOLE-record fit
+  and could teach it to subtract real methane. Cure at one altitude: `parse_csv` reports
+  reality (NaN gaps, no invented values — also persisted as NULL, so stored tests round-trip
+  identically), `process_fieldtest._densify` owns drop-vs-interpolate, and the fit trains
+  only on REAL samples (`ref_mask`). Locked by
+  `test_weather_fit_ignores_interpolated_gap_through_event` + the nasty-CSV test.
+- **F12** (2026-07-07 review) — F6 σ-overconfidence: AR(1) effective-N now lives INSIDE
+  `sensor_sim.effective_noise_floor(rho=)` (one "how noise averages" story), fed by the
+  record's measured ρ̂; `detection_limit`'s averaging curve takes the same `rho`. Guard:
+  ρ̂ is NOT measured on event-dominated records (corrcoef of the plume bump ≈0.98 would
+  collapse that sensor's WLS weight → returns 0 = no correction).
+  `test_effective_noise_floor_rho_reduces_effective_n`,
+  `test_lag1_autocorrelation_refuses_event_dominated_record`.
+- **F13** (2026-07-07 review) — `ill_posed` flag made unit-safe: raw `cond(F)` mixes ppm/m
+  with ppm/(g/s) and flips with leak size; now = correlation-normalized Fisher cond
+  (rank deficiency, e.g. 1 sensor × 2 winds) OR the geometric mirror test
+  `_wind_collinear_blind` (all sensors on one wind-parallel line → crosswind position is
+  reflection-ambiguous; invisible to any local Fisher analysis at the fitted point).
+  `test_ill_posed_flag_is_scale_invariant`.
+- **F14** (2026-07-07 review) — data-quality warnings actually reach the user: parse +
+  process warnings ride the create response, process warnings are recomputed on every
+  detail read (storage keeps raw gaps), and the fieldtests page renders a DATA WARNINGS
+  panel. `/api/fieldtests/invert` refuses tests whose stored `sensor_distance_m` disagree.
+  Accuracy report rides the detail/create responses (pipeline runs once per view, not
+  twice). `test_upload_surfaces_parse_and_process_warnings`,
+  `test_detail_recomputes_process_warnings`,
+  `test_invert_endpoint_rejects_mismatched_sensor_distances`.
+- **F15** (2026-07-07 review) — `accuracy_report` crashed (and 500'd the upload/detail
+  endpoints) on a stored calm-wind test (`u < U_MIN`, where `predict_ppm` raises).
+  Now degrades honestly: `detection_limit: null` + the reason in the recommendation.
+  `test_accuracy_report_survives_calm_wind_metadata`.
 
 ## Constraints & caveats (coded-right ≠ physics-valid)
 

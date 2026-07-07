@@ -30,11 +30,12 @@ from __future__ import annotations
 
 import csv
 import io
+import math
 from dataclasses import dataclass
 
 import numpy as np
 
-from physics.accuracy import estimate_noise_floor
+from physics.accuracy import estimate_lag1_autocorrelation, estimate_noise_floor
 from physics.processing import (
     detect_pattern,
     moving_average,
@@ -51,6 +52,23 @@ from physics.sensor_sim import (
 
 # Upper bound on rows we ingest from one upload — guards against a runaway file.
 MAX_ROWS = 200_000
+
+# Plausibility band for a soft unit-mismatch warning — NOT the sensor's rated
+# 500-12,500 ppm range (real readings sit at 2-40 ppm above background, far below
+# "rated"); this is a wide sanity bound (25% over the rated ceiling) that only
+# flags, never rejects, since a real large leak can legitimately read high.
+# Checked in process_fieldtest (not parse_csv) so STORED tests re-warn on read.
+_PPM_PLAUSIBLE_MIN = -1.0
+_PPM_PLAUSIBLE_MAX = 15_000.0
+
+# process_fieldtest: a partially-filled temperature/humidity column is only
+# interpolated (instead of being dropped entirely) when at least this many real
+# values remain — mirrors accuracy.estimate_noise_floor's minimum-sample threshold.
+_MIN_GOOD_FOR_INTERP = 8
+
+# process_fieldtest: a sample_rate_hz outside this is treated as bad input (Arduino
+# loop rates are nowhere near this fast) and falls back to 1.0 Hz with a warning.
+_MAX_SAMPLE_RATE_HZ = 1000.0
 
 # Accepted header spellings (compared case-insensitively, stripped). The first
 # matching column in the file wins.
@@ -76,13 +94,14 @@ def _to_text(data) -> str:
 
 
 def _num(value):
-    """Parse one cell to float, or None if blank/non-numeric."""
+    """Parse one cell to float, or None if blank/non-numeric/non-finite (NaN/Inf)."""
     if value is None:
         return None
     try:
-        return float(str(value).strip())
+        v = float(str(value).strip())
     except (ValueError, TypeError):
         return None
+    return v if math.isfinite(v) else None
 
 
 def _pick(norm_to_orig: dict, candidates: set):
@@ -93,25 +112,52 @@ def _pick(norm_to_orig: dict, candidates: set):
     return None
 
 
+def _col(vals):
+    # A column is only usable if EVERY row has a number — used for `time`, where a
+    # gap can't be sensibly interpolated against itself. See _col_gappy for the
+    # temperature/humidity columns, whose gaps process_fieldtest may fill later.
+    if any(v is None for v in vals):
+        return None
+    return np.asarray(vals, dtype=float)
+
+
+def _col_gappy(vals):
+    """Temperature/humidity column from float-or-None cells: NaN where missing,
+    None when the column is entirely absent. parse_csv reports reality; the
+    drop-or-interpolate POLICY lives in process_fieldtest (one home, so stored
+    tests re-read from the DB get the identical treatment)."""
+    if all(v is None for v in vals):
+        return None
+    return np.asarray([v if v is not None else np.nan for v in vals], dtype=float)
+
+
 def parse_csv(data) -> dict:
     """
     Parse an uploaded readings CSV into aligned numpy arrays.
 
     Flexible about column names (see the *_NAMES sets): it needs a header row with
     at least a methane column; time, temperature, and humidity are optional. Rows
-    without a usable numeric reading are skipped. A column that is absent, or only
-    partially numeric, comes back as None (so a half-filled weather column never
-    corrupts the linear weather fit).
+    without a usable numeric reading (blank, non-numeric, or NaN/Inf) are skipped.
+    The time column is only usable if every row has one (a gappy clock is dropped,
+    with a warning); temperature/humidity gaps are kept as NaN — parse reports
+    reality, and ``process_fieldtest`` owns the drop-or-interpolate policy, so a
+    test re-read from storage gets the identical treatment.
+
+    Never raises on merely SUSPICIOUS data (unsorted timestamps, duplicates) —
+    those are reported in `warnings` instead, since a meandering field upload may
+    legitimately have an imperfect clock. (The out-of-range ppm check lives in
+    ``process_fieldtest`` for the same one-home reason as the gap policy.)
 
     Returns
     -------
     dict with keys:
       ppm         : 1-D float array (required) — the raw reading incl. background.
-      time        : 1-D float array or None (synthesized later if None).
-      temperature : 1-D float array or None.
-      humidity    : 1-D float array or None.
+      time        : 1-D float array or None (synthesized later if None), sorted.
+      temperature : 1-D float array (NaN gaps) or None.
+      humidity    : 1-D float array (NaN gaps) or None.
       n           : number of readings.
       columns     : which original headers were matched.
+      warnings    : list of human-readable strings flagging suspicious input.
 
     Raises ValueError with a friendly message if there is no header or no readings.
     """
@@ -135,9 +181,11 @@ def parse_csv(data) -> dict:
     humid_key = _pick(norm, _HUMID_NAMES)
 
     times, ppms, temps, humids = [], [], [], []
+    n_skipped = 0
     for row in reader:
         ppm = _num(row.get(ppm_key))
         if ppm is None:
+            n_skipped += 1
             continue                          # skip rows without a usable reading
         ppms.append(ppm)
         times.append(_num(row.get(time_key)) if time_key else None)
@@ -149,21 +197,52 @@ def parse_csv(data) -> dict:
     if not ppms:
         raise ValueError("No numeric methane readings were found in the file.")
 
-    def _col(vals):
-        # A column is only usable if EVERY row has a number — a partial column
-        # would otherwise misalign or break the weather fit.
-        if any(v is None for v in vals):
-            return None
-        return np.asarray(vals, dtype=float)
+    ppm_arr = np.asarray(ppms, dtype=float)
+    warnings: list[str] = []
+
+    if n_skipped:
+        warnings.append(
+            f"{n_skipped} row(s) had no usable methane reading "
+            "(blank, non-numeric, or NaN/Inf) and were skipped."
+        )
+
+    temp_arr = _col_gappy(temps)
+    humid_arr = _col_gappy(humids)
+
+    time_arr = _col(times)
+    if time_key and time_arr is None:
+        n_missing = sum(1 for v in times if v is None)
+        warnings.append(
+            f"The time column has {n_missing} missing value(s); a gappy clock "
+            "can't be trusted, so it was ignored (file order assumed)."
+        )
+    if time_arr is not None and time_arr.size > 1:
+        diffs = np.diff(time_arr)
+        if np.any(diffs < 0):                 # cheap O(n) gate; sort only if needed
+            order = np.argsort(time_arr, kind="stable")
+            warnings.append(
+                "Timestamps were not in increasing order; rows were sorted by time."
+            )
+            ppm_arr = ppm_arr[order]
+            time_arr = time_arr[order]
+            if temp_arr is not None:
+                temp_arr = temp_arr[order]
+            if humid_arr is not None:
+                humid_arr = humid_arr[order]
+            diffs = np.diff(time_arr)
+        n_dupe = int(np.sum(diffs == 0))
+        if n_dupe:
+            warnings.append(f"{n_dupe} duplicate timestamp(s) found in the time column.")
 
     return {
-        "ppm": np.asarray(ppms, dtype=float),
-        "time": _col(times),
-        "temperature": _col(temps),
-        "humidity": _col(humids),
-        "n": len(ppms),
+        "ppm": ppm_arr,
+        "time": time_arr,
+        "temperature": temp_arr,
+        "humidity": humid_arr,
+        "n": len(ppm_arr),
         "columns": {"ppm": ppm_key, "time": time_key,
                     "temperature": temp_key, "humidity": humid_key},
+        "warnings": warnings,
     }
 
 
@@ -176,6 +255,44 @@ def _odd(x) -> int:
     if x < 1:
         return 1
     return x if x % 2 == 1 else x + 1
+
+
+def _densify(col, name: str, warnings: list) -> tuple:
+    """
+    Apply the gap policy to one temperature/humidity column (NaN = missing).
+
+    Dense already → unchanged. Fewer than ``_MIN_GOOD_FOR_INTERP`` real values →
+    drop the column (too sparse to trust), with a warning. Otherwise fill the
+    gaps by linear interpolation against sample index, with a warning — a few
+    dropped serial-print lines don't disable weather correction for the record.
+
+    Returns (dense_array_or_None, real_mask_or_None). The mask marks samples the
+    logger actually recorded; the weather FIT must train only on those (an
+    interpolated ramp through a plume-spanning gap correlates with the event and
+    would teach the fit to subtract real methane — see the weather-fit note in
+    ``process_fieldtest``).
+    """
+    if col is None:
+        return None, None
+    arr = np.asarray(col, dtype=float)
+    real = np.isfinite(arr)
+    n_good = int(real.sum())
+    if n_good == arr.size:
+        return arr, real
+    if n_good < _MIN_GOOD_FOR_INTERP:
+        warnings.append(
+            f"The {name} column has only {n_good} usable value(s) — too sparse "
+            "to trust, so it was dropped (no weather correction from it)."
+        )
+        return None, None
+    idx = np.arange(arr.size, dtype=float)
+    filled = arr.copy()
+    filled[~real] = np.interp(idx[~real], idx[real], arr[real])
+    warnings.append(
+        f"{int(arr.size - n_good)} missing {name} value(s) were linearly "
+        "interpolated (interpolated samples are excluded from the weather fit)."
+    )
+    return filled, real
 
 
 def process_fieldtest(
@@ -210,21 +327,49 @@ def process_fieldtest(
     if n == 0:
         raise ValueError("No readings to process.")
 
+    warnings: list[str] = []
     if time is None:
-        rate = sample_rate_hz if (sample_rate_hz and sample_rate_hz > 0) else 1.0
+        if sample_rate_hz and 0 < sample_rate_hz <= _MAX_SAMPLE_RATE_HZ:
+            rate = sample_rate_hz
+        else:
+            rate = 1.0
+            warnings.append(
+                f"sample_rate_hz={sample_rate_hz!r} is not a plausible cadence; "
+                "assumed 1.0 Hz."
+            )
         time = np.arange(n) / rate
     else:
         time = np.asarray(time, dtype=float)
 
+    n_implausible = int(np.sum((ppm < _PPM_PLAUSIBLE_MIN) | (ppm > _PPM_PLAUSIBLE_MAX)))
+    if n_implausible:
+        warnings.append(
+            f"{n_implausible} of {n} reading(s) fall outside the plausible "
+            f"{_PPM_PLAUSIBLE_MIN:g}-{_PPM_PLAUSIBLE_MAX:g} ppm range — "
+            "check units (e.g. raw ADC counts mistaken for ppm)."
+        )
+
     # 1. Weather correction (only when both columns exist AND actually vary).
+    # Gap policy: NaN cells are interpolated for the SUBTRACTION step, but the fit
+    # trains only on samples the logger really recorded — an interpolated ramp
+    # through a plume-spanning gap correlates with the event, and a fit trained on
+    # it would learn a fake coefficient and subtract real methane.
+    temperature, temp_real = _densify(temperature, "temperature", warnings)
+    humidity, humid_real = _densify(humidity, "humidity", warnings)
     corrected = ppm
     weather_corrected = False
     if temperature is not None and humidity is not None:
-        temperature = np.asarray(temperature, dtype=float)
-        humidity = np.asarray(humidity, dtype=float)
         if temperature.std() > 1e-9 or humidity.std() > 1e-9:
-            corrected, _ = temp_humidity_correct(ppm, temperature, humidity)
-            weather_corrected = True
+            ref_mask = temp_real & humid_real
+            if not np.all(ref_mask) and int(ref_mask.sum()) < _MIN_GOOD_FOR_INTERP:
+                warnings.append(
+                    "Too few samples have BOTH temperature and humidity logged — "
+                    "weather correction skipped."
+                )
+            else:
+                corrected, _ = temp_humidity_correct(ppm, temperature, humidity,
+                                                     ref_mask=ref_mask)
+                weather_corrected = True
 
     # Window sizing.
     bw = _odd(min(601, n)) if baseline_window is None else _odd(baseline_window)
@@ -253,6 +398,9 @@ def process_fieldtest(
         "weather_corrected": weather_corrected,
         "noise_ppm": float(noise_ppm),
         "windows": {"baseline": bw, "smooth": sw, "min_run": int(min_run)},
+        "warnings": warnings,
+        "temperature": temperature,    # °C per sample, or None — for real T_K wiring
+        "humidity": humidity,
     }
 
 
@@ -275,6 +423,9 @@ class InversionPoint:
     random_ppm: float         # averageable noise component (1/√N)
     bias_ppm: float           # non-averageable component (survives averaging)
     detected: bool            # did this sensor see a sustained event?
+    mean_temperature_c: float | None = None  # window-mean air temp (°C), if logged
+    rho_hat: float = 0.0      # measured lag-1 autocorrelation of the quiet record (F6)
+    n_eff: float | None = None  # AR(1)-corrected effective N used for sigma_ppm
 
 
 def _window_from_seconds(time, window_s):
@@ -309,8 +460,18 @@ def aggregate_for_inversion(result: dict, window_s: float | None = None) -> Inve
         window already averages optimally, so smoothing first would only distort the
         noise model. (See the module + CLAUDE.md "two averaging roles" note.)
       • ``sigma_ppm`` is the σ OF THE MEAN, combining the averageable random noise
-        (÷√N over the window) with the non-averageable bias, via the shared
+        (÷√N_eff over the window) with the non-averageable bias, via the shared
         ``sensor_sim.effective_noise_floor``. That is the correct weight for WLS.
+        N_eff is the AR(1) effective sample size from the record's own measured
+        lag-1 autocorrelation ρ̂ (``accuracy.estimate_lag1_autocorrelation``, F6):
+        correlated background shrinks slower than √N, so using the raw window
+        length N would under-estimate σ and over-state confidence in both the WLS
+        weight and the inversion's CRB. NOTE the scope of this fix: it corrects
+        ``sigma_ppm``/the CRB's confidence, NOT the separate ``inversion.converged``
+        signal gate (which intentionally compares against a single-sample floor,
+        not ``sigma_ppm``, for unrelated reasons — see its docstring) — a strongly
+        autocorrelated sourceless record can still trip that gate; that fabrication
+        -rate residual is not closed by this fix.
 
     Bias never averages away, so BOTH framings are always returned and the caller
     picks: subtract the baseline as a known zero (use ``mean_excess_ppm``), or fit
@@ -345,8 +506,26 @@ def aggregate_for_inversion(result: dict, window_s: float | None = None) -> Inve
     # Measure the two noise parts from the whole record's quiet samples, then turn
     # them into the σ of a mean over n_window samples (random shrinks, bias doesn't).
     ne = estimate_noise_floor(excess_unsmoothed, det)
+
+    # F6: a window mean over autocorrelated samples shrinks slower than √N — measure
+    # the record's own lag-1 ρ̂ (never assumed) and let the shared floor apply the
+    # AR(1) effective-N so sigma_ppm isn't over-confident. (n_eff is recomputed here
+    # only so the InversionPoint can REPORT the value the floor used.)
+    rho_hat = estimate_lag1_autocorrelation(excess_unsmoothed, det)
+    n_eff = max(1.0, n_window * (1.0 - rho_hat) / (1.0 + rho_hat))
     sigma_mean = float(effective_noise_floor(ne.random_ppm, ne.bias_ppm,
-                                             n_avg=max(1, n_window)))
+                                             n_avg=max(1, n_window), rho=rho_hat))
+
+    # Real T_K wiring: window-mean of the CSV's own temperature, when logged, so the
+    # inversion/CRB can use the measured air temperature instead of a 20°C default.
+    mean_temperature_c = None
+    temperature = result.get("temperature")
+    if temperature is not None:
+        temp_arr = np.asarray(temperature, dtype=float)
+        if temp_arr.size == len(raw):
+            seg_temp = temp_arr[lo:hi]
+            if seg_temp.size and np.all(np.isfinite(seg_temp)):
+                mean_temperature_c = float(np.mean(seg_temp))
 
     return InversionPoint(
         mean_excess_ppm=mean_excess,
@@ -358,6 +537,9 @@ def aggregate_for_inversion(result: dict, window_s: float | None = None) -> Inve
         random_ppm=float(ne.random_ppm),
         bias_ppm=float(ne.bias_ppm),
         detected=bool(det.detected) if det is not None else False,
+        mean_temperature_c=mean_temperature_c,
+        rho_hat=rho_hat,
+        n_eff=n_eff,
     )
 
 
