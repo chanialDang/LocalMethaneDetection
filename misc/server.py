@@ -52,6 +52,10 @@ DETECT_LEVEL = CH4_BACKGROUND + DETECT_K * SENSOR_NOISE_PPM
 _WEB_DIR = Path(__file__).resolve().parent.parent / "ui" / "web"
 
 app = Flask(__name__, static_folder=str(_WEB_DIR), static_url_path="")
+# Cap the upload body so a runaway/oversized CSV is rejected before it is read into
+# memory (parse_csv's MAX_ROWS caps rows AFTER decoding; this caps bytes first). At
+# 1 Hz a field test is a few MB at most; 32 MB is generous headroom.
+app.config["MAX_CONTENT_LENGTH"] = 32 * 1024 * 1024
 
 # ── One-time field cache ─────────────────────────────────────────────────────
 # compute_field is ~2 ms, but caching means /api/field, /api/caption and /api/ask

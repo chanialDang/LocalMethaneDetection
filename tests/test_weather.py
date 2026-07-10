@@ -171,6 +171,37 @@ def test_summarize_archive_without_direction_does_not_crash():
     assert est.n_hours == 2
 
 
+def test_summarize_archive_missing_wind_or_shortwave_does_not_crash():
+    # Same offline-safe contract as F9, extended to the wind & sun columns: a partial
+    # Open-Meteo response (a variable absent → parse_archive gives None) must still
+    # summarize, not raise a TypeError from np.nanmedian(None).
+    def _mk(**over):
+        kw = dict(times=["2026-06-10T12:00", "2026-06-10T13:00"],
+                  u10=np.array([3.0, 4.0]), direction=np.array([270.0, 270.0]),
+                  shortwave=np.array([800.0, 850.0]), cloud=np.array([10.0, 20.0]))
+        kw.update(over)
+        return weather.ArchiveWind(**kw)
+
+    est_sw = weather.summarize_archive(_mk(shortwave=None))   # sun absent → night-ish
+    assert 1 <= est_sw.stability_class <= 6 and est_sw.n_hours == 2
+    est_u = weather.summarize_archive(_mk(u10=None))          # wind absent → u NaN, no crash
+    assert 1 <= est_u.stability_class <= 6 and est_u.n_hours == 2
+
+
+def test_wind_for_site_date_returns_none_on_unusable_wind(monkeypatch):
+    # All-NaN wind means the wind is unknown → wind_for_site_date must return None so
+    # the caller falls back to its default, NOT hand a NaN wind to the inversion.
+    bad = weather.ArchiveWind(
+        times=["t0", "t1"], u10=np.array([np.nan, np.nan]),
+        direction=np.array([270.0, 270.0]), shortwave=np.array([800.0, 850.0]),
+        cloud=np.array([10.0, 20.0]),
+    )
+    monkeypatch.setattr(weather, "fetch_wind_archive", lambda *a, **k: bad)
+    out = weather.wind_for_site_date("Custer", "2026-06-10")
+    assert out is None
+    assert "wind" in (weather.LAST_WEATHER_ERROR or "").lower()
+
+
 # ── site resolution ──────────────────────────────────────────────────────────
 def test_resolve_site_by_name():
     assert weather.resolve_site("Custer Road Transfer Station") == weather.SITES["custer"]

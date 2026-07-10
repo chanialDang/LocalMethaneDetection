@@ -31,7 +31,9 @@ from __future__ import annotations
 import csv
 import io
 import math
+import re
 from dataclasses import dataclass
+from datetime import datetime
 
 import numpy as np
 
@@ -74,40 +76,239 @@ _MAX_SAMPLE_RATE_HZ = 1000.0
 # matching column in the file wins.
 _PPM_NAMES = {"ppm", "ch4", "ch4_ppm", "methane", "reading", "value", "conc",
               "concentration", "ppm_raw", "raw", "ch4_ppm_raw"}
+# Generic/ambiguous synonyms — a column literally called 'raw'/'value'/'reading'
+# could be ADC counts or voltage, not calibrated ppm. A PREFERRED name (ch4/methane/
+# ppm/…) is always chosen over these when both are present; only when no preferred
+# column exists do we fall back to a generic one (accepted, then flagged downstream).
+_PPM_GENERIC = {"reading", "value", "raw"}
+_PPM_PREFERRED = _PPM_NAMES - _PPM_GENERIC
 _TIME_NAMES = {"time", "t", "seconds", "sec", "s", "timestamp", "elapsed",
                "time_s", "t_seconds", "ts"}
 _TEMP_NAMES = {"temp", "temperature", "t_c", "tempc", "temp_c", "celsius", "tc"}
 _HUMID_NAMES = {"humidity", "rh", "humid", "relative_humidity", "humidity_pct",
                 "rh_pct", "humid_pct"}
+_ALL_COLUMN_NAMES = _PPM_NAMES | _TIME_NAMES | _TEMP_NAMES | _HUMID_NAMES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CSV PARSING
 # ─────────────────────────────────────────────────────────────────────────────
+# A decimal-comma numeric cell ("1,9" meaning 1.9) — only trusted when the file's
+# delimiter is NOT a comma (European ';'/tab exports), so a real comma-delimited
+# file's cells (already split) can never be misread as a decimal comma.
+_DECIMAL_COMMA_RE = re.compile(r"^[+-]?\d+,\d+$")
+
+
 def _to_text(data) -> str:
-    """Accept a file-like, bytes, or str and return decoded text (BOM-tolerant)."""
+    """Accept a file-like, bytes, or str and return decoded text (BOM-tolerant).
+
+    Strips a UTF-8 BOM for BOTH bytes (via utf-8-sig) and already-decoded str
+    (leading U+FEFF), so the first header — often the ppm column — is never left
+    with an invisible BOM that defeats name matching.
+    """
     if hasattr(data, "read"):
         data = data.read()
     if isinstance(data, bytes):
         data = data.decode("utf-8-sig", errors="replace")
+    # Drop characters that are never meaningful in a numeric readings CSV but do break
+    # parsing: embedded NUL bytes (serial glitch — csv.reader rejects "line contains
+    # NUL"), and zero-width / invisible unicode + stray BOMs (from a copy-pasted header
+    # — they silently defeat column-name matching). Strip rather than crash/reject.
+    for ch in ("\x00", "​", "‌", "‍", "⁠", "﻿"):
+        data = data.replace(ch, "")
     return data
 
 
-def _num(value):
-    """Parse one cell to float, or None if blank/non-numeric/non-finite (NaN/Inf)."""
+def _strip_preamble(text: str) -> str:
+    """Drop leading blank lines, '#'/'//' comment lines, AND prose banner lines that
+    precede the header.
+
+    Dataloggers print a banner before the real header — either commented
+    ('# Started 2026-…', '// logger v3') or plain prose ('Logging started',
+    'Battery 3.7V') — or a blank lead-in; csv.DictReader would otherwise treat that
+    first physical line as the header and fail to find a methane column. A leading
+    line is KEPT (as the header / first data row) once it looks like tabular data: it
+    contains a delimiter, OR is a single numeric value (header-less), OR carries a
+    recognized column-name token. Everything before that — blanks, comments, and prose
+    banners with no delimiter/number/known token — is skipped. Only LEADING junk is
+    removed; a comment/banner AFTER the header stays for the row loop to skip as a
+    no-reading row."""
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith("#") or s.startswith("//"):
+            continue
+        if (any(d in s for d in (",", ";", "\t"))
+                or _num(s) is not None
+                or (_tokens(s) & _ALL_COLUMN_NAMES)):
+            return "\n".join(lines[i:])
+        # else: a prose banner line ('Logging started') — skip it and keep looking.
+    return text   # all blank/comment/banner → let DictReader raise the friendly error
+
+
+def _sniff_delimiter(text: str) -> str:
+    """Pick the field delimiter from the header line by a simple frequency count.
+
+    Deterministic and robust where csv.Sniffer is finicky (short files, quoted
+    cells): comma unless ';' or tab clearly dominates the FIRST line. A student's
+    Excel 'Save As CSV' on a non-US locale, or a serial capture, may use ';' or
+    tab; everything else about parsing is unchanged."""
+    header = text.splitlines()[0] if text else ""
+    counts = {",": header.count(","), ";": header.count(";"), "\t": header.count("\t")}
+    best = max(counts, key=counts.get)
+    return best if counts[best] > 0 else ","
+
+
+def _num(value, decimal_comma: bool = False):
+    """Parse one cell to float, or None if blank/non-numeric/non-finite (NaN/Inf).
+
+    When ``decimal_comma`` is set (a non-comma-delimited file), a cell like "1,9"
+    is read as 1.9. This is gated on the delimiter so a comma-delimited file — whose
+    cells are already split and never contain a stray comma — is never affected.
+    """
     if value is None:
         return None
+    s = str(value).strip()
     try:
-        v = float(str(value).strip())
+        v = float(s)
     except (ValueError, TypeError):
-        return None
+        if decimal_comma and _DECIMAL_COMMA_RE.match(s):
+            try:
+                v = float(s.replace(",", "."))
+            except (ValueError, TypeError):
+                return None
+        else:
+            return None
     return v if math.isfinite(v) else None
 
 
-def _pick(norm_to_orig: dict, candidates: set):
-    """Return the original header whose normalized form is in `candidates`, else None."""
-    for low, original in norm_to_orig.items():
+# Recognized date-time and clock-only spellings for a non-numeric time column.
+_TS_DATETIME_FORMATS = (
+    "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%f",
+    "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d %H:%M:%S%z",          # RTC with timezone offset
+    "%Y/%m/%d %H:%M:%S", "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M",
+)
+_TS_CLOCK_FORMATS = ("%H:%M:%S.%f", "%H:%M:%S", "%H:%M",
+                     "%I:%M:%S %p", "%I:%M %p")             # 12-hour AM/PM
+
+
+def _parse_timestamps(raws):
+    """Convert an ISO-8601 / date / clock-time column to ELAPSED SECONDS.
+
+    Returns a float ndarray (seconds from the first row), or None if the column
+    isn't a recognizable, gap-free time format — any missing cell yields None, so a
+    truly gappy clock is dropped rather than guessed. A clock-only ('HH:MM:SS')
+    column is unwrapped across a single midnight rollover.
+    """
+    if not raws or any(r is None or str(r).strip() == "" for r in raws):
+        return None
+    strs = [str(r).strip().rstrip("Zz") for r in raws]
+
+    def _first_match(formats):
+        for fmt in formats:
+            try:
+                datetime.strptime(strs[0], fmt)
+                return fmt
+            except ValueError:
+                continue
+        return None
+
+    if _first_match(_TS_DATETIME_FORMATS):
+        kind, fmts = "datetime", _TS_DATETIME_FORMATS
+    elif _first_match(_TS_CLOCK_FORMATS):
+        kind, fmts = "clock", _TS_CLOCK_FORMATS
+    else:
+        return None
+
+    parsed = []
+    for s in strs:
+        dt = None
+        for fmt in fmts:
+            try:
+                dt = datetime.strptime(s, fmt)
+                break
+            except ValueError:
+                continue
+        if dt is None:
+            return None                        # column not uniformly this format
+        parsed.append(dt)
+
+    if kind == "clock":
+        secs = np.asarray(
+            [p.hour * 3600 + p.minute * 60 + p.second + p.microsecond / 1e6
+             for p in parsed], dtype=float)
+        if secs.size > 1:                      # unwrap one midnight rollover
+            secs[1:] += np.cumsum(np.where(np.diff(secs) < -1.0, 86400.0, 0.0))
+    else:
+        t0 = parsed[0]
+        secs = np.asarray([(p - t0).total_seconds() for p in parsed], dtype=float)
+    return secs - secs[0]
+
+
+def _normalize_time_units(time_arr, warnings: list):
+    """Rebase epoch timestamps and auto-scale millisecond clocks to ELAPSED SECONDS.
+
+    Auto-corrects only on strong evidence, always with a loud warning (policy: never
+    silently misread). Two independent corrections:
+      • Absolute (epoch) magnitude (>1e9): a field test never starts billions of
+        seconds in, so this is unambiguously a wall-clock stamp → rebase to elapsed.
+      • Implausibly large inter-sample step (median ≥ 50): Arduino millis() (or
+        epoch-ms after rebasing) reads 1000× too slow → divide by 1000. A genuine
+        very-slow cadence trips this too, but the warning tells the user to override.
+    """
+    t = np.asarray(time_arr, dtype=float)
+    if t.size == 0:
+        return t
+    tmin = float(np.min(t))
+    if tmin > 1e9:
+        t = t - tmin
+        warnings.append(
+            "Time column looks like an absolute (epoch) timestamp; rebased to "
+            "seconds elapsed from the first sample.")
+    if t.size > 1:
+        med_dt = float(np.median(np.abs(np.diff(t))))
+        if med_dt >= 50.0:
+            t = t / 1000.0
+            warnings.append(
+                f"Time advances ~{med_dt:g} units per sample — that looks like "
+                "milliseconds, so it was divided by 1000 to get seconds. If your "
+                "logger really samples this slowly, pass the sample rate explicitly.")
+    return t
+
+
+def _tokens(name) -> set:
+    """Lowercased alphanumeric tokens of a header: 'CH4 (ppm)' → {'ch4', 'ppm'}."""
+    return set(re.findall(r"[a-z0-9]+", (name or "").lower()))
+
+
+def _pick(norm_to_orig: dict, candidates: set, preferred: set | None = None):
+    """Return the original header matching `candidates`, else None.
+
+    Match order (most specific first, so a real column always beats a fuzzy one):
+      1. exact normalized-name match on a `preferred` name (methane: 'ppm'/'ch4'/…)
+      2. exact normalized-name match on any candidate  (the original behaviour)
+      3. token match on a `preferred` name             ('CH4 (ppm)' → token 'ch4')
+      4. token match on any candidate                  ('Humidity (%)' → token 'humidity')
+
+    Token matching splits on non-alphanumerics, so 'runtime' does NOT match 'time'
+    (it is a single token) — avoiding the substring false positives a naive
+    `in`-check would create.
+    """
+    items = list(norm_to_orig.items())            # (normalized_full, original), column order
+    if preferred:
+        for low, original in items:
+            if low in preferred:
+                return original
+    for low, original in items:
         if low in candidates:
+            return original
+    if preferred:
+        for low, original in items:
+            if _tokens(original) & preferred:
+                return original
+    for low, original in items:
+        if _tokens(original) & candidates:
             return original
     return None
 
@@ -161,8 +362,10 @@ def parse_csv(data) -> dict:
 
     Raises ValueError with a friendly message if there is no header or no readings.
     """
-    text = _to_text(data)
-    reader = csv.DictReader(io.StringIO(text))
+    text = _strip_preamble(_to_text(data))
+    delimiter = _sniff_delimiter(text)
+    decimal_comma = delimiter != ","
+    reader = csv.DictReader(io.StringIO(text), delimiter=delimiter)
     if not reader.fieldnames:
         raise ValueError(
             "The CSV looks empty — it needs a header row and at least a "
@@ -170,28 +373,41 @@ def parse_csv(data) -> dict:
         )
 
     norm = {(name or "").strip().lower(): name for name in reader.fieldnames}
-    ppm_key = _pick(norm, _PPM_NAMES)
+    ppm_key = _pick(norm, _PPM_NAMES, preferred=_PPM_PREFERRED)
     if ppm_key is None:
+        # No recognizable methane header. If row 1 is entirely numeric there is
+        # probably NO header at all (a raw serial dump) — fall back to positional
+        # columns with a loud warning. Otherwise the header truly lacks methane.
+        field_nums = [_num(fn, decimal_comma) for fn in reader.fieldnames]
+        if reader.fieldnames and all(v is not None for v in field_nums):
+            return _parse_headerless(text, delimiter, len(reader.fieldnames))
         raise ValueError(
             "No methane column found. Add a header like 'ppm' "
-            "(accepted: ppm, ch4, reading, value, concentration)."
+            "(accepted: ppm, ch4, methane, reading, value, concentration), or "
+            "upload a header-less file whose 1st column is time and 2nd is ppm."
         )
     time_key = _pick(norm, _TIME_NAMES)
     temp_key = _pick(norm, _TEMP_NAMES)
     humid_key = _pick(norm, _HUMID_NAMES)
 
-    times, ppms, temps, humids = [], [], [], []
+    times, ppms, temps, humids, time_raws = [], [], [], [], []
     n_skipped = 0
+    n_ragged = 0
+    truncated = False
     for row in reader:
-        ppm = _num(row.get(ppm_key))
+        if row.get(None):        # DictReader collects fields beyond the header here
+            n_ragged += 1
+        ppm = _num(row.get(ppm_key), decimal_comma)
         if ppm is None:
             n_skipped += 1
             continue                          # skip rows without a usable reading
         ppms.append(ppm)
-        times.append(_num(row.get(time_key)) if time_key else None)
-        temps.append(_num(row.get(temp_key)) if temp_key else None)
-        humids.append(_num(row.get(humid_key)) if humid_key else None)
+        times.append(_num(row.get(time_key), decimal_comma) if time_key else None)
+        time_raws.append(row.get(time_key) if time_key else None)   # for date/clock strings
+        temps.append(_num(row.get(temp_key), decimal_comma) if temp_key else None)
+        humids.append(_num(row.get(humid_key), decimal_comma) if humid_key else None)
         if len(ppms) >= MAX_ROWS:
+            truncated = next(reader, None) is not None   # were there more rows?
             break
 
     if not ppms:
@@ -206,16 +422,43 @@ def parse_csv(data) -> dict:
             "(blank, non-numeric, or NaN/Inf) and were skipped."
         )
 
+    if truncated:
+        warnings.append(
+            f"File exceeded {MAX_ROWS:,} readings; only the first {MAX_ROWS:,} were "
+            "read and the rest were ignored."
+        )
+
+    if n_ragged:
+        warnings.append(
+            f"{n_ragged} row(s) had more columns than the header; the extra value(s) "
+            "were ignored — check your delimiter (a decimal comma in a comma-separated "
+            "file does this)."
+        )
+
     temp_arr = _col_gappy(temps)
     humid_arr = _col_gappy(humids)
 
     time_arr = _col(times)
-    if time_key and time_arr is None:
-        n_missing = sum(1 for v in times if v is None)
-        warnings.append(
-            f"The time column has {n_missing} missing value(s); a gappy clock "
-            "can't be trusted, so it was ignored (file order assumed)."
-        )
+    if time_arr is not None:
+        time_arr = _normalize_time_units(time_arr, warnings)
+    elif time_key is not None:
+        # Numeric parse failed for some/all rows. Either genuine timestamp strings
+        # (ISO-8601 / clock) we can convert to elapsed seconds, or a truly gappy
+        # numeric clock we must drop (file order assumed).
+        ts = _parse_timestamps(time_raws)
+        if ts is not None and ts.size == len(ppm_arr):
+            time_arr = ts
+            warnings.append(
+                "Time column was a date/clock format; converted to seconds "
+                "elapsed from the first sample."
+            )
+        else:
+            n_missing = sum(1 for v in times if v is None)
+            warnings.append(
+                f"The time column has {n_missing} unparseable value(s) (need "
+                "numeric seconds or a recognizable date/clock format); it was "
+                "ignored (file order assumed)."
+            )
     if time_arr is not None and time_arr.size > 1:
         diffs = np.diff(time_arr)
         if np.any(diffs < 0):                 # cheap O(n) gate; sort only if needed
@@ -244,6 +487,30 @@ def parse_csv(data) -> dict:
                     "temperature": temp_key, "humidity": humid_key},
         "warnings": warnings,
     }
+
+
+def _parse_headerless(text: str, delimiter: str, ncols: int) -> dict:
+    """Re-parse a header-less numeric dump by assigning columns positionally.
+
+    Row 1 parsed as all-numeric, so there is no header line; assume the logger
+    wrote columns in the conventional order and prepend a synthetic header, then
+    re-run ``parse_csv`` so EVERY row (including the former row 1) is read as data.
+    A loud warning records the assumption — this is a best guess with the reasoning
+    surfaced, not a silent reinterpretation. Column order assumed:
+      1 col  → ppm
+      2 cols → time, ppm
+      3 cols → time, ppm, temperature
+      4+ cols→ time, ppm, temperature, humidity  (extra columns ignored)
+    """
+    names = ["ppm"] if ncols == 1 else ["time", "ppm", "temperature", "humidity"][:ncols]
+    out = parse_csv(delimiter.join(names) + "\n" + text)
+    out["warnings"].insert(
+        0,
+        "No header row was detected (row 1 is numeric); assumed columns by "
+        "position: " + ", ".join(names) + ". Verify this matches your logger's "
+        "column order.",
+    )
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -295,6 +562,48 @@ def _densify(col, name: str, warnings: list) -> tuple:
     return filled, real
 
 
+def _unit_sanity_warnings(ppm, n: int) -> list:
+    """Non-rejecting warnings when a column's magnitude doesn't look like ppm.
+
+    The reading is NEVER dropped (a real large leak can legitimately read high) —
+    these only flag a LIKELY unit mistake so a miscalibrated upload can't silently
+    masquerade as ppm. Lives in process_fieldtest (not parse_csv) so STORED tests
+    re-warn on every read (F14). Auto-correction is deliberately NOT done here: the
+    ppb/ADC/% cases are ambiguous (a real leak can read high), so we warn and leave
+    the value, matching the 'auto-fix only when unambiguous' policy.
+    """
+    w = []
+    n_bad = int(np.sum((ppm < _PPM_PLAUSIBLE_MIN) | (ppm > _PPM_PLAUSIBLE_MAX)))
+    if n_bad:
+        w.append(
+            f"{n_bad} of {n} reading(s) fall outside the plausible "
+            f"{_PPM_PLAUSIBLE_MIN:g}-{_PPM_PLAUSIBLE_MAX:g} ppm range — "
+            "check units (e.g. raw ADC counts mistaken for ppm)."
+        )
+    finite = ppm[np.isfinite(ppm)]
+    if finite.size == 0:
+        return w
+    med = float(np.median(finite))
+    integer_like = bool(np.allclose(finite, np.round(finite)))
+    if integer_like and med > 50.0:
+        w.append(
+            "Readings are whole numbers well above the ppm band — they look like "
+            "raw ADC/uncalibrated counts, not calibrated ppm. Apply your sensor's "
+            "calibration curve before trusting the result."
+        )
+    elif med > 100.0:
+        w.append(
+            f"Readings (median {med:g}) are far above the expected ~2-40 ppm band — "
+            "if this column is in ppb, divide by 1000 to get ppm."
+        )
+    if med < 0.5 and finite.size >= 5:
+        w.append(
+            f"Readings (median {med:g}) sit below the ~1.9 ppm methane background — "
+            "check units (a % volume or an Rs/Ro ratio, not ppm?)."
+        )
+    return w
+
+
 def process_fieldtest(
     ppm,
     temperature=None,
@@ -341,13 +650,7 @@ def process_fieldtest(
     else:
         time = np.asarray(time, dtype=float)
 
-    n_implausible = int(np.sum((ppm < _PPM_PLAUSIBLE_MIN) | (ppm > _PPM_PLAUSIBLE_MAX)))
-    if n_implausible:
-        warnings.append(
-            f"{n_implausible} of {n} reading(s) fall outside the plausible "
-            f"{_PPM_PLAUSIBLE_MIN:g}-{_PPM_PLAUSIBLE_MAX:g} ppm range — "
-            "check units (e.g. raw ADC counts mistaken for ppm)."
-        )
+    warnings.extend(_unit_sanity_warnings(ppm, n))
 
     # 1. Weather correction (only when both columns exist AND actually vary).
     # Gap policy: NaN cells are interpolated for the SUBTRACTION step, but the fit

@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import json
 import math
+import warnings
 from dataclasses import dataclass
 from urllib.parse import urlencode
 from urllib.request import urlopen
@@ -163,6 +164,23 @@ def _circular_mean_deg(degrees) -> float:
     return float(np.degrees(ang) % 360.0)
 
 
+def _nanmedian_or(col, default: float) -> float:
+    """Nan-aware median of an archive column, or ``default`` when the column is absent
+    (None), empty, or entirely NaN.
+
+    Keeps ``summarize_archive`` offline-safe on a degraded/partial Open-Meteo response:
+    a missing variable never raises. This generalizes the F9 guarantee (which covered
+    only ``direction``) to every column — previously ``u10`` and ``shortwave`` went
+    unguarded and ``np.nanmedian(None)`` raised a TypeError.
+    """
+    if col is None or getattr(col, "size", 0) == 0:
+        return default
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")        # an all-NaN column warns; we handle it
+        m = float(np.nanmedian(col))
+    return m if np.isfinite(m) else default
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Archive parsing + summary — pure, fixture-tested
 # ─────────────────────────────────────────────────────────────────────────────
@@ -229,18 +247,18 @@ def summarize_archive(archive: ArchiveWind, z_target: float = 2.0,
     if len(archive) == 0:
         raise ValueError("Empty archive — nothing to summarize.")
 
-    u10 = float(np.nanmedian(archive.u10))
+    # Every column is None/all-NaN-safe (F9, generalized): a partial archive never
+    # raises. u10 defaults to NaN (wind unknown → flagged by wind_for_site_date);
+    # sun/cloud default to 0 (→ the night branch, a safe neutral fallback).
+    u10 = _nanmedian_or(archive.u10, float("nan"))
     u = adjust_wind_to_height(u10, z_target=z_target, z0=z0)
-    # Direction may be absent (parse_archive returns None when the column is missing)
-    # or all-NaN; default to 0° rather than crashing on ~np.isnan(None) (F9). The
-    # offline-safe contract is "never raise on a degraded archive".
     if archive.direction is None:
         direction = 0.0
     else:
         valid = archive.direction[~np.isnan(archive.direction)]
         direction = _circular_mean_deg(valid) if valid.size else 0.0
-    rad = float(np.nanmedian(archive.shortwave))
-    cloud = float(np.nanmedian(archive.cloud)) if archive.cloud is not None else 0.0
+    rad = _nanmedian_or(archive.shortwave, 0.0)
+    cloud = _nanmedian_or(archive.cloud, 0.0)
     cls = pasquill_class(u10, rad, cloud)   # class from the 10 m wind (as tabulated)
 
     return WindEstimate(
@@ -323,4 +341,11 @@ def wind_for_site_date(site, start_date: str, end_date: str | None = None,
                                  end_date or start_date)
     if archive is None or len(archive) == 0:
         return None
-    return summarize_archive(archive, z_target=z_target)
+    est = summarize_archive(archive, z_target=z_target)
+    if not math.isfinite(est.u):
+        # A summary with no usable wind (all missing/NaN) is worse than nothing —
+        # returning None makes the caller fall back to its default instead of feeding
+        # a NaN wind into the inversion (where C ∝ 1/u would propagate the NaN).
+        LAST_WEATHER_ERROR = "archive returned no usable wind speed (all missing/NaN)"
+        return None
+    return est

@@ -35,10 +35,10 @@ across noise/wind/weather/geometry + final fenceline verdict.
 `python3` = `/usr/bin/python3` (3.9.6; has numpy/matplotlib). Packages are real, so imports
 are absolute (`from physics.plume import …`) and entry points run as modules from repo root.
 
-- **Tests:** `python3 -m pytest tests/ -v` → **176/176 PASS**. One file:
+- **Tests:** `python3 -m pytest tests/ -v` → **265/265 PASS**. One file:
   `python3 -m pytest tests/test_inversion.py -v`. One test:
   `… tests/test_inversion.py::test_name`. CI/headless: `MPLBACKEND=Agg python3 -m pytest
-  tests/ -q` (~3 s).
+  tests/ -q` (~4 s).
 - **Run + dashboard:** `python3 -m misc.demo` — validates, writes `plume_contour.png`,
   serves the dashboard at `http://127.0.0.1:5050`, opens the browser. **Port 5050**
   (macOS AirPlay squats on 5000). matplotlib is headless (Agg); the live graph is the browser.
@@ -46,6 +46,12 @@ are absolute (`from physics.plume import …`) and entry points run as modules f
   exit 0, no server).
 - **Other entry points:** `python3 -m misc.server` (localhost Flask API) ·
   `python3 -m misc.ask "question"` (one-shot CLI Q&A, no chat loop).
+- **CSV preflight:** `python3 -m misc.preflight yourfile.csv` — field self-check on a real
+  upload BEFORE trusting it: reports detected columns, inferred time units/cadence, ppm
+  sanity, every data warning, detection outcome, and a GO/CHECK/STOP verdict (exit 0/1/2).
+- **Dress rehearsal:** `python3 -m misc.rehearse` — generate a realistic multi-sensor, multi-wind
+  scenario with a KNOWN hidden source, write it as CSVs, run the full parse→process→fuse pipeline,
+  and print recovered-vs-true source. A pre-field dry run of the whole deployment workflow.
 - **σ table:** `python3 physics/generate_sigma_table.py` regenerates the CSV; the committed
   file is byte-identical to the generator (reproducible provenance).
 
@@ -64,10 +70,14 @@ physics/  plume.py (Gaussian plume + Briggs σ) · sensor_sim.py (synthetic data
 ui/       explain.py (caption/Q&A/interpret; compute_field) · web/ (index/fieldtests/
           explain .html + common/app/fieldtests .js + styles.css + vendor/plotly.min.js)
 misc/     demo.py (validate+sweep+PNG+dashboard) · server.py (localhost Flask API) ·
-          ask.py (one-shot CLI Q&A) · db.py (Postgres | SQLite)
-tests/    one per module + fixtures/openmeteo_archive.json
+          ask.py (one-shot CLI Q&A) · db.py (Postgres | SQLite) ·
+          preflight.py (real-CSV field self-check: GO/CHECK/STOP) ·
+          rehearse.py (full-pipeline dress rehearsal with a known source)
+tests/    one per module + fixtures/openmeteo_archive.json (plus test_fieldtest_transferability.py,
+          test_preflight.py, test_inversion_anchors.py, test_pipeline_e2e.py, test_sigma_table.py,
+          test_rehearse.py)
 root      conftest.py · samples/custer_sample.csv · Procfile (optional Railway) ·
-          requirements.txt · CLAUDE.md
+          requirements.txt · CLAUDE.md · docs/DEPLOYMENT.md (field runbook: bench→CSV→invert)
 ```
 
 **Path notes:** `plume.py`/`generate_sigma_table.py` resolve the CSV next to themselves
@@ -166,11 +176,14 @@ as an **upper bound** with a ~160× `implied_Q_range`. Sweeps the centreline dow
 only (most generous for detection).
 
 **`fieldtest.py`** — bridge from a real CSV to the per-test graph and the inversion.
-`parse_csv` (flexible columns; needs methane, time/T/H optional) → `process_fieldtest`
-(same `processing.py` pipeline, raw frame: `raw ≈ baseline + excess`). `aggregate_for_inversion`
-→ `InversionPoint(mean_excess_ppm, sigma_ppm, …)`: time-mean of the **unsmoothed** excess
-over a meander window + the σ-of-the-mean weight (NOT pre-smoothed — WLS averages optimally).
-`make_sample_readings` for pre-sensor demos.
+`parse_csv` (**real-world-robust**, F16: `#`/blank preamble, `;`/tab/decimal-comma delimiters,
+token-matched header spellings with `ppm` beating generic `raw`/`value`, header-less positional
+fallback, `millis()`/epoch/ISO/clock time → seconds, unit-sanity flags; never silently misreads)
+→ `process_fieldtest` (same `processing.py` pipeline, raw frame: `raw ≈ baseline + excess`).
+`aggregate_for_inversion` → `InversionPoint(mean_excess_ppm, sigma_ppm, …)`: time-mean of the
+**unsmoothed** excess over a meander window + the σ-of-the-mean weight (NOT pre-smoothed — WLS
+averages optimally). `make_sample_readings` for pre-sensor demos. Run `misc.preflight` on a real
+upload first to see exactly what was detected.
 
 **`weather.py`** — real wind + Pasquill class from the Open-Meteo archive (free, no key,
 stdlib `urllib`). `fetch_wind_archive` is the only networked call; `parse_archive` /
@@ -306,10 +319,22 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   At low-ppm Melissa, *drift* (not random noise) sets the detection floor and averaging
   can't touch it. Currently `0.00` = optimistic → every "detectable?" verdict is a best
   case until measured (hours of slow drift on the real Figaro).
+  **📚 LIT (2026-07-09) — external confirmation this is THE governing floor:** Shah et al.
+  2023 (AMT 16:3391) saw field baseline excursions of **+78% / −20**%; Furuta et al. 2024
+  (AMT 17:2103) had to fit the baseline *piecewise in time*; Honeycutt et al. 2019 (Sensors
+  19:3157) rate TGS-2611 the most baseline-stable low-cost CH₄ sensor yet still requiring
+  "dynamic background subtraction." Non-averageable drift is the documented failure mode of
+  this sensor class. See memory `literature-validation`.
 - **🔬 Assumed sensor constants** (`sensor_sim.py`) — `SENSOR_NOISE_PPM 0.30`,
   `TEMP_COEFF 0.05`, `HUMID_COEFF 0.02`, `BASELINE_DRIFT 1.00`. Placeholders that drive
   every detectability/accuracy number. Measure on a zero-air/clean-air bench run; then every
   limit, error bar, and grade re-computes automatically — no other change.
+  **📚 LIT (2026-07-09):** peer-reviewed characterization of the EXACT sensor puts the
+  realistic resolution at **~1–2 ppm, not 0.30** — Shah et al. 2023 (RMSE <±1 ppm for CH₄
+  ≤28 ppm; 1 ppm → only 1.4–2% resistance drop) and Furuta et al. 2024 ("can distinguish 2
+  from 10 ppm, but not 2 from 3 ppm"; field RMSE ≈0.5–0.65 ppm after heavy correction). So
+  `SENSOR_NOISE_PPM=0.30` is optimistic ~3–6× → it *worsens* every verdict, esp. Melissa.
+  Humidity DOMINATES the raw signal at ~2 ppm (Shah 2023) → supports the nonlinear T·H item.
 - **F6 residual** (`inversion.py`) — strongly autocorrelated *background* (ρ≈0.8–0.95) still
   fabricates a source ~40% (the detector fires on sustained wander) — that fabrication-rate
   residual remains open. The σ-overconfidence half is CLOSED (see F12): `sigma_ppm` now uses
@@ -397,6 +422,41 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   endpoints) on a stored calm-wind test (`u < U_MIN`, where `predict_ppm` raises).
   Now degrades honestly: `detection_limit: null` + the reason in the recommendation.
   `test_accuracy_report_survives_calm_wind_metadata`.
+- **F16** (2026-07-09 hardening) — **real-world CSV transferability** for the imminent
+  Custer/Melissa uploads. `parse_csv`/`process_fieldtest` were fitted to the clean sample and
+  hard-failed or *silently misread* a student logger's real output. Now handled (policy: never
+  silently misinterpret — auto-fix only when unambiguous, else warn loud): leading `#`/blank
+  preamble skipped; `;`/tab delimiters + decimal-comma sniffed; header spellings matched by
+  token containment (`CH4 (ppm)`) with a real `ppm` column always beating a generic
+  `raw`/`value`; header-less numeric dumps assigned positional columns; `millis()`/epoch time
+  auto-scaled to seconds and ISO-8601/clock strings parsed (was the worst silent bug — it
+  collapsed the meander window to n=1); ADC/ppb/% unit mismatches flagged; MAX_ROWS truncation
+  warned; Flask `MAX_CONTENT_LENGTH` cap; str-BOM stripped. Then an **adversarial fuzz sweep**
+  (~100 cases, 4 rounds, loop-until-dry) hardened the survivors: NUL bytes stripped (were a
+  `csv.Error` crash), non-`#` prose banners skipped, ragged rows (extra fields) warned (catches a
+  decimal-comma-in-a-comma-file silent misread), ISO-tz/AM-PM time parsed, zero-width unicode
+  stripped, and `preflight.run_preflight` made never-raise. 34 tests in
+  `tests/test_fieldtest_transferability.py` (incl. a capstone "every quirk at once"). New field
+  tool `misc/preflight.py` (GO/CHECK/STOP), `tests/test_preflight.py`. F11/F14 + DB NaN-gap
+  round-trip preserved.
+- **Math re-verification (2026-07-09)** — a 3-agent independent audit re-derived the forward
+  (mass conservation → Q<0.001%; units 1499.6 ppm/(g/m³); off-cardinal rotation) and inversion
+  (closed-form Q; CRB vs a from-scratch FD-Jacobian; fusion) math against *independent* routes:
+  **no coding errors** — only the documented validity limits (F6/F7). Five independent anchors
+  the suite lacked are now locked in `tests/test_inversion_anchors.py`: absolute CRB vs a
+  from-scratch FD-Jacobian, closed-form Q = Σwgd/Σwg², the `effective_noise_floor` quadrature +
+  its bias/random limits, `detection_limit` LOD/LOQ + linear-Q back-solve, and multi-snapshot
+  fusion recovery + Fisher-addition CRB tightening. Plus `tests/test_pipeline_e2e.py` (CSV text →
+  recovered source) and `tests/test_sigma_table.py` (σ-table byte-identical to its generator). A
+  literature pass confirmed the modeling caveats — see the 📚 LIT notes above and memory
+  `literature-validation`.
+- **F17** (2026-07-09) — `weather.py` offline-safe contract generalized. `summarize_archive`
+  guarded `cloud`/`direction` (F9) but `np.nanmedian(None)` on a missing `wind_speed_10m` or
+  `shortwave_radiation` column **crashed** (TypeError) — a partial Open-Meteo response would
+  take down `wind_for_site_date`. New `_nanmedian_or` makes every column None/all-NaN-safe;
+  `wind_for_site_date` now returns None (+ reason) when wind is all-NaN rather than feeding a
+  NaN `u` (C∝1/u) into the inversion. `test_summarize_archive_missing_wind_or_shortwave_does_not_crash`,
+  `test_wind_for_site_date_returns_none_on_unusable_wind`.
 
 ## Constraints & caveats (coded-right ≠ physics-valid)
 
