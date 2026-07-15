@@ -679,7 +679,7 @@ def process_fieldtest(
     temperature=None,
     humidity=None,
     time=None,
-    noise_ppm: float = SENSOR_NOISE_PPM,
+    noise_ppm: float | None = None,
     sample_rate_hz: float = 1.0,
     baseline_window: int | None = None,
     smooth_window: int | None = None,
@@ -691,7 +691,16 @@ def process_fieldtest(
 
     Order (all from processing.py): optional temperature/humidity correction →
     rolling low-percentile baseline subtraction → moving-average smoothing →
-    sustained-event detection against k·noise.
+    sustained-event detection against k·floor.
+
+    Two passes (so detection is honest about DRIFT, not just fast noise): a
+    provisional pass locates the event; the final pass (a) re-fits the weather
+    correction EXCLUDING that event window, so humidity that rises during a plume
+    can't be mis-attributed, and (b) measures the detection floor from the record's
+    own quiet samples — `√(random² + bias²)` via `estimate_noise_floor` /
+    `effective_noise_floor`, so non-averageable drift raises the bar instead of
+    sailing past a fixed assumed floor. `noise_ppm=None` (default) measures the
+    floor; passing a float overrides it verbatim (used by tests / legacy callers).
 
     Window defaults scale with record length: the baseline window is the whole
     record (capped at 601 samples) so a single plume bump sits well inside it, and
@@ -705,6 +714,8 @@ def process_fieldtest(
     n = len(ppm)
     if n == 0:
         raise ValueError("No readings to process.")
+    if not np.any(np.isfinite(ppm)):
+        raise ValueError("All readings are non-finite (NaN/inf) — nothing to process.")
 
     warnings: list[str] = []
     if time is None:
@@ -722,40 +733,87 @@ def process_fieldtest(
 
     warnings.extend(_unit_sanity_warnings(ppm, n))
 
-    # 1. Weather correction (only when both columns exist AND actually vary).
+    # Weather correction (only when both columns exist AND actually vary).
     # Gap policy: NaN cells are interpolated for the SUBTRACTION step, but the fit
     # trains only on samples the logger really recorded — an interpolated ramp
     # through a plume-spanning gap correlates with the event, and a fit trained on
     # it would learn a fake coefficient and subtract real methane.
     temperature, temp_real = _densify(temperature, "temperature", warnings)
     humidity, humid_real = _densify(humidity, "humidity", warnings)
-    corrected = ppm
-    weather_corrected = False
-    if temperature is not None and humidity is not None:
-        if temperature.std() > 1e-9 or humidity.std() > 1e-9:
-            ref_mask = temp_real & humid_real
-            if not np.all(ref_mask) and int(ref_mask.sum()) < _MIN_GOOD_FOR_INTERP:
-                warnings.append(
-                    "Too few samples have BOTH temperature and humidity logged — "
-                    "weather correction skipped."
-                )
-            else:
-                corrected, _ = temp_humidity_correct(ppm, temperature, humidity,
-                                                     ref_mask=ref_mask)
-                weather_corrected = True
+
+    have_weather = (temperature is not None and humidity is not None
+                    and (temperature.std() > 1e-9 or humidity.std() > 1e-9))
+    base_mask = (temp_real & humid_real) if have_weather else None
+    weather_usable = have_weather
+    if have_weather and not np.all(base_mask) and int(base_mask.sum()) < _MIN_GOOD_FOR_INTERP:
+        warnings.append(
+            "Too few samples have BOTH temperature and humidity logged — "
+            "weather correction skipped."
+        )
+        weather_usable = False
 
     # Window sizing.
     bw = _odd(min(601, n)) if baseline_window is None else _odd(baseline_window)
     sw = _odd(min(61, max(5, n // 50))) if smooth_window is None else _odd(smooth_window)
 
-    # 2. Baseline subtraction, then 3. smoothing of the excess.
-    excess_raw, baseline = subtract_baseline(
-        corrected, window=bw, method="percentile", percentile=25.0
-    )
-    excess = moving_average(excess_raw, window=sw)
+    def _clean(ref_mask):
+        """Weather-correct (trained on ref_mask) → baseline → smooth. One stage of a pass."""
+        corrected = ppm
+        coeffs: dict = {}
+        wcorr = False
+        if weather_usable:
+            corrected, coeffs = temp_humidity_correct(ppm, temperature, humidity,
+                                                      ref_mask=ref_mask)
+            wcorr = True
+        excess_raw, baseline = subtract_baseline(
+            corrected, window=bw, method="percentile", percentile=25.0)
+        return corrected, coeffs, moving_average(excess_raw, window=sw), baseline, wcorr
 
-    # 4. Detection of a sustained event above k·noise.
-    detection = detect_pattern(excess, noise_std=noise_ppm, k=k, min_run=min_run)
+    def _measured_floor(corrected, baseline, det):
+        """Drift-inclusive 1σ floor from the record: random ⊕ non-averageable bias."""
+        ne = estimate_noise_floor(corrected - baseline, det)
+        return float(effective_noise_floor(ne.random_ppm, ne.bias_ppm, 1)), ne
+
+    # ── Pass A — provisional: detect on the RAW signal (NO weather correction yet). ──
+    # A methane event that coincides with a weather swing must stay VISIBLE here, so Pass B
+    # can exclude it from the weather fit — otherwise the full-record fit silently subtracts
+    # the event as "weather" and hides it from the detector (it can never be excluded). The
+    # provisional floor is the RANDOM term only (successive-difference estimate, robust to
+    # the event's slow shape) so the provisional pass stays sensitive; Pass B does the
+    # honest drift-inclusive floor.
+    excess_a_raw, base_a = subtract_baseline(
+        ppm, window=bw, method="percentile", percentile=25.0)
+    excess_a = moving_average(excess_a_raw, window=sw)
+    if noise_ppm is not None:
+        floor0 = float(noise_ppm)
+    else:
+        ne0 = estimate_noise_floor(ppm - base_a, None)
+        floor0 = max(float(ne0.random_ppm), 1e-9)
+    det_prov = detect_pattern(excess_a, noise_std=floor0, k=k, min_run=min_run)
+
+    # ── Pass B — final: re-fit weather EXCLUDING the event (Fix 3), then measure the
+    # drift-inclusive floor on the now-clean quiet samples and detect against it (Fix 1). ──
+    ref_mask = base_mask
+    if weather_usable and det_prov.detected:
+        keep = np.ones(n, dtype=bool)
+        lo = max(0, det_prov.start_idx - 5)
+        hi = min(n, det_prov.end_idx + 5)
+        keep[lo:hi] = False                              # drop the event window (guard=5)
+        cand = base_mask & keep
+        if int(cand.sum()) >= _MIN_GOOD_FOR_INTERP:
+            ref_mask = cand
+        else:
+            warnings.append(
+                "The detected event spans too much of the record to exclude it from the "
+                "weather fit — used the full window (humidity may be partly mis-attributed)."
+            )
+    corrected, coeffs, excess, baseline, weather_corrected = _clean(ref_mask)
+
+    if noise_ppm is not None:                            # explicit override honored verbatim
+        floor, ne = float(noise_ppm), None
+    else:
+        floor, ne = _measured_floor(corrected, baseline, det_prov)
+    detection = detect_pattern(excess, noise_std=floor, k=k, min_run=min_run)
 
     # Put the displayed baseline back in the raw frame so raw ≈ baseline + excess.
     weather_part = ppm - corrected                    # zeros when not corrected
@@ -766,10 +824,14 @@ def process_fieldtest(
         "raw": ppm,
         "baseline": baseline_display,
         "excess": excess,
-        "threshold": float(k * noise_ppm),
+        "threshold": float(k * floor),
         "detection": detection,
         "weather_corrected": weather_corrected,
-        "noise_ppm": float(noise_ppm),
+        "weather_coeffs": coeffs,
+        "noise_ppm": float(floor),
+        "noise_random_ppm": (float(ne.random_ppm) if ne is not None else None),
+        "noise_bias_ppm": (float(ne.bias_ppm) if ne is not None else None),
+        "noise_floor_measured": bool(ne is not None),
         "windows": {"baseline": bw, "smooth": sw, "min_run": int(min_run)},
         "warnings": warnings,
         "temperature": temperature,    # °C per sample, or None — for real T_K wiring

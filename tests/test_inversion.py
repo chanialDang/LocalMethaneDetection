@@ -452,6 +452,46 @@ def test_f7_realistic_dataset_is_well_posed_for_the_fit():
     assert est.Q == pytest.approx(Q_F7, rel=0.5)            # Q roughly sane; position is the casualty
 
 
+# ── Fix 2: honest localization — non-averageable bias downgrades converged ───
+def test_common_mode_bias_flags_suspect_and_downgrades_converged():
+    # A real, well-localised source: clean data (bias=0) must converge, not flagged.
+    true_src, Q_true = (5.0, -3.0), 6.0
+    clean = _truth_points(true_src, Q_true)
+    est_clean = inversion.invert(SENSORS, clean, WIND_U, WIND_DIR, stability_class=STAB)
+    assert est_clean.converged is True and est_clean.bias_suspect is False
+
+    # Same readings, but inject a large per-sensor NON-averageable bias (drift/humidity
+    # surrogate) = 25% of the plume peak. Independent oracle: bias_fraction is
+    # median(bias)/max(mean_excess) = 0.25 by construction, above the 0.10 gate.
+    peak = max(p.mean_excess_ppm for p in clean)
+    bias = 0.25 * peak
+    biased = [
+        InversionPoint(
+            mean_excess_ppm=p.mean_excess_ppm, sigma_ppm=p.sigma_ppm, n_window=p.n_window,
+            window=p.window, mean_raw_ppm=p.mean_raw_ppm, baseline_ppm=p.baseline_ppm,
+            random_ppm=p.random_ppm, bias_ppm=bias, detected=p.detected,
+        ) for p in clean
+    ]
+    est = inversion.invert(SENSORS, biased, WIND_U, WIND_DIR, stability_class=STAB)
+    assert est.fit_quality["bias_fraction"] == pytest.approx(0.25, rel=0.02)
+    assert est.bias_suspect is True            # drift is a big share of the signal
+    assert est.converged is False              # ...so the fit is NOT claimed converged
+    assert est.crb_std is not None             # the CRB (a precision bound) is still reported
+
+
+def test_crb_widened_by_model_uncertainty():
+    # Fix 2a: the CRB σ is widened by the datasheet MODEL term, so a bigger non-averageable
+    # error can only WIDEN the precision bound. Compare a low-σ fit's CRB to a high-σ one;
+    # both include the same +MODEL² term, and the larger σ must give the larger bound.
+    from physics.accuracy import MODEL_UNCERTAINTY_PPM
+    assert MODEL_UNCERTAINTY_PPM > 0
+    tight = _truth_points((5.0, -3.0), 6.0, sigma=0.1)
+    loose = _truth_points((5.0, -3.0), 6.0, sigma=0.5)
+    a = inversion.invert(SENSORS, tight, WIND_U, WIND_DIR, stability_class=STAB)
+    b = inversion.invert(SENSORS, loose, WIND_U, WIND_DIR, stability_class=STAB)
+    assert b.crb_std["x"] > a.crb_std["x"]     # larger measurement σ → wider bound
+
+
 # ── the deployment light switch: raw processed tests → source ────────────────
 def test_invert_field_tests_end_to_end():
     # The real entry point: each sensor's processed record → aggregate → invert,

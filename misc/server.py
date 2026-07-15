@@ -265,7 +265,10 @@ def _process_stored(ft: dict):
     arrays = _stored_arrays(ft)
     if arrays is None:
         return None
-    noise = ft.get("noise_ppm") or SENSOR_NOISE_PPM
+    # None → process_fieldtest MEASURES the drift-inclusive floor from the record (Fix 1).
+    # Only an explicit user-supplied noise_ppm overrides that; the legacy 0.30 default is
+    # gone so a real upload gets the honest, drift-aware detection threshold by default.
+    noise = ft.get("noise_ppm")
     rate = ft.get("sample_rate_hz") or 1.0
     return fieldtest.process_fieldtest(
         arrays["ppm"], temperature=arrays["temperature"],

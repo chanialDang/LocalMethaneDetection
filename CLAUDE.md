@@ -35,7 +35,7 @@ across noise/wind/weather/geometry + final fenceline verdict.
 `python3` = `/usr/bin/python3` (3.9.6; has numpy/matplotlib). Packages are real, so imports
 are absolute (`from physics.plume import …`) and entry points run as modules from repo root.
 
-- **Tests:** `python3 -m pytest tests/ -v` → **265/265 PASS**. One file:
+- **Tests:** `python3 -m pytest tests/ -v` → **321/321 PASS**. One file:
   `python3 -m pytest tests/test_inversion.py -v`. One test:
   `… tests/test_inversion.py::test_name`. CI/headless: `MPLBACKEND=Agg python3 -m pytest
   tests/ -q` (~4 s).
@@ -347,6 +347,12 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   19:3157) rate TGS-2611 the most baseline-stable low-cost CH₄ sensor yet still requiring
   "dynamic background subtraction." Non-averageable drift is the documented failure mode of
   this sensor class. See memory `literature-validation`.
+  **PARTIALLY ADDRESSED IN SOFTWARE (F18/F19, 2026-07-15):** the pipeline now MEASURES the
+  in-record drift proxy and uses it (detection floor + inversion `bias_suspect`) instead of the
+  assumed 0.30, so drift no longer silently fabricates detections or confident sources. What
+  remains hardware: the actual `BIAS_FLOOR_PPM` constant is still `0.00` (a real zero-air bench
+  run over hours is needed to pin the sensor's true drift magnitude); the in-record proxy is a
+  floor, not a calibration.
 - **🔬 Assumed sensor constants** (`sensor_sim.py`) — `SENSOR_NOISE_PPM 0.30`,
   `TEMP_COEFF 0.05`, `HUMID_COEFF 0.02`, `BASELINE_DRIFT 1.00`. Placeholders that drive
   every detectability/accuracy number. Measure on a zero-air/clean-air bench run; then every
@@ -489,6 +495,37 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   `wind_for_site_date` now returns None (+ reason) when wind is all-NaN rather than feeding a
   NaN `u` (C∝1/u) into the inversion. `test_summarize_archive_missing_wind_or_shortwave_does_not_crash`,
   `test_wind_for_site_date_returns_none_on_unusable_wind`.
+- **F18** (2026-07-15) — **honest DETECTION floor** (a Melissa adversarial run showed drift
+  fabricating detections at 3.5–5.4σ). `process_fieldtest` no longer uses the *assumed*
+  `SENSOR_NOISE_PPM=0.30`; `noise_ppm=None` (new default) MEASURES the drift-inclusive floor
+  `√(random²+bias²)` from the record via a two-pass structure (provisional detect on the RAW
+  signal → final detect against the measured floor). Explicit `noise_ppm` still overrides
+  (back-compat). Deployment callers (`server`, `preflight`, `calibrate`, `rehearse`) pass None.
+  `test_measured_floor_rejects_drift_the_assumed_floor_fabricates`. NOTE the honest LIMIT: a
+  *slow monotonic* drift over a very quiet baseline is statistically indistinguishable from a
+  slow plume at one sensor — single-sensor detection is a screen; **F19 is where confidence is
+  enforced.**
+- **F19** (2026-07-15) — **honest LOCALIZATION** (the same run returned `converged=True` with a
+  ~0.6 m CRB while 27 m off). Two parts in `invert_multi`: (a) the CRB σ is widened by the
+  non-averageable `MODEL_UNCERTAINTY_PPM` (in-record bias is already in `sigma_ppm` — not
+  re-added, no double-count), so the precision bound stops ignoring known error; (b) a
+  `bias_suspect` gate — when the non-averageable drift is > `_BIAS_SUSPECT_FRACTION` (10%) of the
+  plume peak, `converged` is downgraded to False (`SourceEstimate.fit_quality`/`bias_suspect`).
+  A residual/reduced-χ² test was tried first and REJECTED by measurement: the fenceline's soft
+  downwind axis leaves large-but-benign residuals even on a perfect fusion, so residual magnitude
+  can't tell benign geometry from malign bias — only the bias-to-signal ratio can (cf. F6/F10:
+  measurement caught a wrong desk diagnosis). `test_common_mode_bias_flags_suspect_and_downgrades_converged`,
+  `test_crb_widened_by_model_uncertainty`.
+- **F20** (2026-07-15) — **event-coincident humidity** no longer mis-attributed. The T/H
+  correction's training mask now EXCLUDES the provisionally-detected event window, so a humidity
+  swing that rises *during* a plume can't teach a phantom coefficient and subtract real methane.
+  Shares F18's two-pass (Pass A detects on the RAW signal so the event stays visible to be
+  excluded). The true cure remains a bench-measured resistance-domain `RHCORR`
+  (`sensor_frontend.py`) — this is a software mitigation. `test_event_coincident_humidity_not_misattributed`.
+- **Adversarial harness** (`tests/test_adversarial.py`, 2026-07-15) — the "never break unless
+  absurd data" bar: plausible regimes (heavy drift, humidity spikes, per-sensor drift,
+  autocorrelated noise) never crash and never fabricate a converged source; calm wind / all-NaN /
+  NUL-byte input raise cleanly (added an all-non-finite guard in `process_fieldtest`).
 
 ## Constraints & caveats (coded-right ≠ physics-valid)
 

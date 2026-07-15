@@ -70,7 +70,7 @@ from physics.plume import (
     RELEASE_HEIGHT_M, SENSOR_HEIGHT_M, U_MIN, predict_excess_grid,
 )
 from physics.fieldtest import InversionPoint, aggregate_for_inversion
-from physics.accuracy import crb_source_bound_multi
+from physics.accuracy import crb_source_bound_multi, MODEL_UNCERTAINTY_PPM
 from physics.sensor_sim import DETECT_K, effective_noise_floor
 
 # F7 honesty flag — two DETECTORS, both dimensionless (a raw cond(F) mixes units,
@@ -89,6 +89,16 @@ from physics.sensor_sim import DETECT_K, effective_noise_floor
 # CRB is honestly wide rather than degenerate — that is cured by invert_multi
 # (more snapshots), not by a flag (see CLAUDE.md F7).
 _CRB_ILL_POSED_COND_THRESHOLD = 1e7
+
+# Localization honesty gate: the ratio of the non-averageable BIAS (drift/humidity) to the
+# plume SIGNAL. Random noise averages away in each sensor's time-mean (√N), so it does NOT
+# systematically move the fit; only the non-averageable bias does — and a common-mode bias
+# shifts the estimate WITHOUT widening the (random-noise) CRB, which is exactly why a fit can
+# be metres off while the CRB looks tight. We flag when the drift is a large enough fraction
+# of the plume peak that it could materially corrupt the location. (A residual-magnitude /
+# reduced-χ² test does NOT work here: the fenceline's soft downwind axis leaves large but
+# BENIGN residuals even on a perfect fusion recovery — measurement showed this, cf. F6/F10.)
+_BIAS_SUSPECT_FRACTION = 0.10
 
 
 def _wind_collinear_blind(sensors_xy, snaps) -> bool:
@@ -118,9 +128,15 @@ class SourceEstimate:
     """
     The recovered leak. ``x``/``y`` are map coordinates (m, East/North), ``Q`` is
     the emission rate (g/s). ``crb_std`` is the theoretical best-possible 1σ on each
-    parameter — compare your run-to-run scatter against it to know if the fit is as
-    tight as the physics permits. ``ill_posed`` flags a near-singular Fisher matrix
-    (e.g. collinear sensors) — see ``_CRB_ILL_POSED_COND_THRESHOLD``.
+    parameter — a PRECISION bound (random-noise scatter) only. ``ill_posed`` flags a
+    near-singular Fisher matrix (e.g. collinear sensors).
+
+    ``crb_std`` cannot see SYSTEMATIC bias (common-mode drift/humidity), which shifts
+    the estimate without widening the noise-derived variance. ``bias_suspect`` /
+    ``fit_quality`` are the accuracy guard for exactly that: a reduced-χ² goodness-of-fit
+    test — if the residuals are far larger than the measured sensor noise allows, the
+    data are not a single clean plume + iid noise, the fit is untrustworthy regardless
+    of how tight ``crb_std`` looks, and ``converged`` is downgraded to False.
     """
     x: float                  # source East coordinate (m, map frame)
     y: float                  # source North coordinate (m, map frame)
@@ -138,6 +154,8 @@ class SourceEstimate:
     note: str                 # short provenance / caveat
     n_snapshots: int = 1      # how many wind-snapshots were fused (1 = single)
     ill_posed: bool = False   # True when the CRB's Fisher matrix is near-singular
+    fit_quality: dict | None = None   # reduced-χ² goodness-of-fit {reduced_chi2,dof,threshold,bias_suspect}
+    bias_suspect: bool = False        # True when residuals ≫ noise model → systematic bias corrupts the fit
 
 
 @dataclass
@@ -177,6 +195,7 @@ class _Snap(NamedTuple):
     d: np.ndarray            # per-sensor mean excess (ppm)
     w: np.ndarray            # per-sensor WLS weight 1/σ²
     floor1: np.ndarray       # per-sensor single-sample detection floor (ppm)
+    bias: np.ndarray         # per-sensor NON-averageable bias/drift (ppm) — the drift proxy
     u: float                 # wind speed for this snapshot (m/s)
     wind_dir_deg: float      # wind FROM-direction for this snapshot (° from N)
     stability: int           # Pasquill class used for this snapshot (1–6)
@@ -197,13 +216,14 @@ def _prep_points(points, n) -> tuple:
         if hasattr(p, "mean_excess_ppm"):
             floor1 = float(effective_noise_floor(p.random_ppm, p.bias_ppm, n_avg=1))
             floor1 = floor1 if floor1 > 0.0 else float(p.sigma_ppm)
-            return float(p.mean_excess_ppm), float(p.sigma_ppm), floor1
-        return float(p[0]), float(p[1]), float(p[1])     # (mean, σ) tuple: σ is the floor
+            return float(p.mean_excess_ppm), float(p.sigma_ppm), floor1, float(p.bias_ppm)
+        return float(p[0]), float(p[1]), float(p[1]), 0.0   # (mean, σ) tuple: no separate bias
 
     data = [datum(p) for p in points]
-    d = np.array([m for m, _, _ in data])
-    sig = np.array([s for _, s, _ in data])
-    floor1 = np.array([f for _, _, f in data])
+    d = np.array([m for m, _, _, _ in data])
+    sig = np.array([s for _, s, _, _ in data])
+    floor1 = np.array([f for _, _, f, _ in data])
+    bias = np.array([b for _, _, _, b in data])
     # Fail loud on a non-finite datum: a single NaN/inf reading otherwise propagates
     # through the shared-Q sums and silently collapses the whole fit to Q≈0 /
     # not-converged — a meaningless answer that looks like "saw nothing".
@@ -213,7 +233,7 @@ def _prep_points(points, n) -> tuple:
         raise ValueError(f"non-finite reading or σ at sensor index(es) {bad}; "
                          "every mean_excess_ppm and sigma_ppm must be finite")
     sig = np.where(sig > 1e-9, sig, 1e-9)                # guard a zero σ (infinite weight)
-    return d, sig, floor1, 1.0 / (sig * sig)
+    return d, sig, floor1, bias, 1.0 / (sig * sig)
 
 
 def _eval_cells(xs, ys, sensors_xy, snaps, H, z, T_K, P_Pa) -> list:
@@ -429,8 +449,8 @@ def invert_multi(
     for sn in snapshots:
         if sn.u < U_MIN:
             raise ValueError(f"wind u={sn.u} m/s is below the model minimum {U_MIN} m/s")
-        d, sig, floor1, w = _prep_points(sn.points, n)
-        base.append((d, w, floor1, float(sn.u), float(sn.wind_dir_deg),
+        d, sig, floor1, bias, w = _prep_points(sn.points, n)
+        base.append((d, w, floor1, bias, float(sn.u), float(sn.wind_dir_deg),
                      sn.stability_class))
 
     if bounds is None:
@@ -446,8 +466,8 @@ def invert_multi(
         # Each snapshot keeps its OWN class when set, else takes the trial class. ``trial``
         # is None only when classes==[None], which by need_fit happens only when every
         # snapshot's class IS set — so the ``else trial`` branch is never taken then.
-        resolved = [_Snap(d, w, floor1, u, wd, int(st if st is not None else trial))
-                    for (d, w, floor1, u, wd, st) in base]
+        resolved = [_Snap(d, w, floor1, bias, u, wd, int(st if st is not None else trial))
+                    for (d, w, floor1, bias, u, wd, st) in base]
         # Cost closure binds the resolved snapshots so the optimiser only varies (x, y).
         def batch_fn(xs, ys, _snaps=resolved):
             return _eval_cells(xs, ys, sensors_xy, _snaps, H, z, T_K, P_Pa)
@@ -459,26 +479,46 @@ def invert_multi(
     rmse = float(np.sqrt(np.mean(resid ** 2)))
     K = len(best_snaps)
 
-    # "Converged" only with real signal to localise: some sensor in some snapshot must
-    # stand clearly above its own per-sample floor (DETECT_K·single-sample σ, F6) AND
-    # the fit must explain a positive Q.
+    # Signal gate (F6): some sensor in some snapshot must stand clearly above its own
+    # single-sample floor (DETECT_K·σ) AND the fit must explain a positive Q.
     d_all = np.concatenate([s.d for s in best_snaps])
     floor1_all = np.concatenate([s.floor1 for s in best_snaps])
-    converged = bool(np.any(d_all > DETECT_K * floor1_all) and Q > 0.0)
+    signal_ok = bool(np.any(d_all > DETECT_K * floor1_all) and Q > 0.0)
     cls = int(best_snaps[0].stability)
+
+    # Localization honesty gate (the "is the error bar lying?" catch). Compare the
+    # non-averageable bias (drift/humidity) to the plume peak: bias_fraction = median(bias) /
+    # max(signal). Above _BIAS_SUSPECT_FRACTION the drift is a large enough share of the signal
+    # to materially shift the location in a way the (precision-only) CRB cannot see.
+    fit_quality = None
+    bias_suspect = False
+    if signal_ok:
+        bias_all = np.concatenate([s.bias for s in best_snaps])
+        signal_ppm = float(np.max(d_all))                 # the plume-peak sensor reading
+        bias_ppm = float(np.median(bias_all))             # typical non-averageable drift
+        bias_fraction = bias_ppm / max(signal_ppm, 1e-9)
+        bias_suspect = bool(bias_fraction > _BIAS_SUSPECT_FRACTION)
+        fit_quality = {"bias_fraction": bias_fraction, "threshold": _BIAS_SUSPECT_FRACTION,
+                       "bias_ppm": bias_ppm, "signal_ppm": signal_ppm,
+                       "rmse_ppm": float(rmse), "bias_suspect": bias_suspect}
+
+    # Converged requires BOTH real signal AND a drift small enough not to corrupt the fit.
+    converged = signal_ok and not bias_suspect
 
     crb_std = None
     ill_posed = False
     note = f"shrinking-grid WLS; Q closed-form (linear-in-Q); {K} snapshot(s)"
-    if not converged:
+    if not signal_ok:
         note = "no sensor shows signal above 3σ — Q≈0, position unconstrained (upper-bound only)"
     else:
         if with_crb:
             # Representative iid σ (the CRB assumes equal independent noise): RMS of the
-            # per-sensor σ across all snapshots = √(mean(1/w)) since w = 1/σ². Fisher info
-            # adds across snapshots → combined (tighter) bound.
+            # per-sensor σ across all snapshots = √(mean(1/w)) since w = 1/σ². Widen it by
+            # the non-averageable datasheet MODEL term so the precision bound stops ignoring
+            # known error; the in-record bias is ALREADY inside sigma_rep (via
+            # aggregate_for_inversion's effective_noise_floor) — do NOT re-add it (double-count).
             w_all = np.concatenate([s.w for s in best_snaps])
-            sigma_rep = float(np.sqrt(np.mean(1.0 / w_all)))
+            sigma_rep = float(np.hypot(np.sqrt(np.mean(1.0 / w_all)), MODEL_UNCERTAINTY_PPM))
             try:
                 views = [(s.u, s.wind_dir_deg, int(s.stability)) for s in best_snaps]
                 crb = crb_source_bound_multi(src_pos=(x, y), Q=Q, views=views, H=H,
@@ -488,7 +528,7 @@ def invert_multi(
                 degenerate = crb.condition_number > _CRB_ILL_POSED_COND_THRESHOLD
                 mirror = _wind_collinear_blind(sensors_xy, best_snaps)
                 ill_posed = degenerate or mirror
-                note += f"; CRB at σ≈{sigma_rep:.2f} ppm ({crb.note})"
+                note += f"; CRB (precision) at σ≈{sigma_rep:.2f} ppm ({crb.note})"
                 if degenerate:
                     note += "; Fisher matrix near-singular (too few independent measurements)"
                 if mirror:
@@ -496,13 +536,17 @@ def invert_multi(
                              "is mirror-ambiguous")
             except Exception as exc:             # never let the referee crash the fit
                 note += f"; CRB unavailable ({type(exc).__name__})"
+        if bias_suspect:
+            note += (f"; non-averageable drift is {fit_quality['bias_fraction']:.0%} of the "
+                     f"signal (> {fit_quality['threshold']:.0%}) — systematic bias may corrupt "
+                     "the location, NOT converged (CRB is a precision bound and misses this)")
 
     return SourceEstimate(
         x=x, y=y, Q=Q, stability_class=cls, u=float(best_snaps[0].u),
         wind_dir_deg=float(best_snaps[0].wind_dir_deg), cost=cost, rmse_ppm=rmse,
         residuals_ppm=[float(r) for r in resid], n_sensors=n,
         crb_std=crb_std, converged=converged, note=note, n_snapshots=K,
-        ill_posed=ill_posed,
+        ill_posed=ill_posed, fit_quality=fit_quality, bias_suspect=bias_suspect,
     )
 
 

@@ -51,6 +51,12 @@ them in `nodes/nodeN.py` and let `apply_node` land them on the globals.
   *random* floor only; the real floor is dominated by non-averageable drift and T/RH
   sensitivity (unmeasured). `misc/calibrate.py` reports the **total honest floor**, not 0.018.
 - **Mitchell needs gas** and even then RMSE ≈ 5.1 ppm (~the size of the low-end signal).
+- **Humidity correction is a software mitigation, not a cure.** `process_fieldtest` excludes the
+  detected event window from the temperature/humidity fit (so a humidity swing during a plume
+  can't be mis-subtracted — F20), and the detection floor is measured drift-inclusively (F18).
+  But the real fix for humidity cross-sensitivity is a **bench-measured, resistance-domain
+  `RHCORR`** in `physics/sensor_frontend.py`, applied before voltage→ppm — the ppm-domain linear
+  correction can only partly undo a nonlinear humidity response. Measure it on the bench.
 
 ## Note: stale dispersion-table reference
 The handoff (`docs/HANDOFF_to_coding_agent.md` §7) cites `otm33a_dispersion_sigma.csv`. That

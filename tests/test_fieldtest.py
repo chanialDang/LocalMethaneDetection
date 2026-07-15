@@ -267,6 +267,55 @@ def test_process_empty_raises():
         fieldtest.process_fieldtest(np.array([]))
 
 
+# ─── Fix 1: measured drift-inclusive floor must not let drift fabricate a detection ───
+def test_measured_floor_rejects_drift_the_assumed_floor_fabricates():
+    # A SOURCELESS record: realistic field noise (0.5 ppm) + slow drift, NO event. Truth,
+    # independent by construction: detected=False. The MEASURED floor folds the noise+drift
+    # into a data-driven threshold that clears the wander; the fixed assumed 0.30 floor does
+    # not and fabricates a detection — the exact bug Fix 1 closes.
+    rng = np.random.default_rng(11)
+    n = 300
+    t = np.arange(n, dtype=float)
+    drift = 1.0 * np.sin(2 * np.pi * t / (2.3 * n))
+    ppm = 1.9 + drift + rng.normal(0, 0.5, n)
+
+    meas = fieldtest.process_fieldtest(ppm, time=t)                 # default → MEASURED floor
+    old = fieldtest.process_fieldtest(ppm, time=t, noise_ppm=0.30)  # the assumed-0.30 bug
+
+    assert meas["noise_floor_measured"] is True
+    assert meas["noise_ppm"] > old["noise_ppm"]        # measured floor is honestly higher
+    assert meas["detection"].detected is False         # ...so drift is not fabricated
+    assert old["threshold"] == pytest.approx(0.90)
+    assert old["detection"].detected is True           # the fixed 0.30 floor DOES fabricate
+
+
+# ─── Fix 3: event-coincident humidity must not be mis-attributed as a weather term ───
+def test_event_coincident_humidity_not_misattributed():
+    # A real +4 ppm methane event; humidity is flat OUTSIDE the event and rises +12 %RH
+    # ONLY during it. The TRUE humidity coefficient is ZERO by construction — the RH rise
+    # merely coincides with the plume. The event-excluded weather fit must not learn a
+    # phantom humidity coefficient and subtract real methane.
+    from physics.processing import temp_humidity_correct
+    n = 300
+    t = np.arange(n, dtype=float)
+    ev0, ev1 = 120, 200
+    rng = np.random.default_rng(3)
+    ppm = 1.9 + rng.normal(0, 0.05, n)
+    ppm[ev0:ev1] += 4.0
+    temp = np.full(n, 20.0)
+    rh = np.full(n, 50.0)
+    rh[ev0:ev1] += 12.0
+
+    res = fieldtest.process_fieldtest(ppm, temperature=temp, humidity=rh, time=t)
+    assert abs(res["weather_coeffs"].get("b_humid", 0.0)) < 0.05   # no phantom coefficient
+    assert np.max(res["excess"]) > 0.9 * 4.0                       # the 4 ppm event survives
+
+    # Independent contrast: a WHOLE-record fit (no event exclusion) DOES learn the phantom
+    # (≈ 4 ppm / 12 %RH ≈ 0.33) — the exact bug the exclusion prevents.
+    _, whole = temp_humidity_correct(ppm, temp, rh)               # ref_mask=None → whole record
+    assert whole.get("b_humid", 0.0) > 0.15
+
+
 # ─── summarize + interpret ──────────────────────────────────────────────────────
 def _detected_facts():
     sample = fieldtest.make_sample_readings(n=600, event_ppm=4.0, seed=0)
