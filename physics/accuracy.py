@@ -299,6 +299,39 @@ class DetectionLimit:
     curve: list               # [{n, floor_ppm, lod_ppm, min_Q}] averaging sweep
 
 
+# Datasheet-extrapolation model error: Van den Bossche 2017 reports ±1.7 ppm variable error
+# on this exact TGS 2611-E00 at low ppm — a documented benchmark, not a guess. It is
+# non-averageable (a calibration/model error, not jitter), so it enters the floor in
+# quadrature alongside the measured random and bias terms. Used by misc/calibrate.py and
+# misc/preflight.py so the "honest floor" is computed one way everywhere.
+MODEL_UNCERTAINTY_PPM = 1.7
+
+
+def honest_detection_floor(
+    random_ppm: float,
+    bias_ppm: float,
+    model_ppm: float = MODEL_UNCERTAINTY_PPM,
+    k: float = DETECT_K,
+) -> dict:
+    """Combine the three floor sources into ONE honest detection floor + LOD/LOQ.
+
+    ``total = √(random² + bias² + model²)`` — the measured averageable jitter, the
+    measured non-averageable drift proxy, and the datasheet-extrapolation model error,
+    all in quadrature. The point is that averaging beats ``random`` but never ``bias`` or
+    ``model``, so the honest floor is dominated by the latter two — never by the flattering
+    short-term electrical number. Returns a JSON-safe dict.
+    """
+    total = float(np.sqrt(float(random_ppm) ** 2 + float(bias_ppm) ** 2 + float(model_ppm) ** 2))
+    return {
+        "random_ppm": float(random_ppm),
+        "bias_ppm": float(bias_ppm),
+        "model_ppm": float(model_ppm),
+        "total_floor_ppm": total,
+        "lod_ppm": float(k * total),
+        "loq_ppm": float(10.0 * total),
+    }
+
+
 def detection_limit(
     random_ppm: float,
     bias_ppm: float = 0.0,

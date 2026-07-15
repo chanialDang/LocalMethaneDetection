@@ -6,6 +6,9 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 
+# macOS Finder metadata
+.DS_Store
+
 # Local field-test database — created when DATABASE_URL is unset (SQLite fallback).
 # Real persistence lives in Railway Postgres; this local file is per-machine only.
 fieldtests.db

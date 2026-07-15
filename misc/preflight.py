@@ -34,6 +34,7 @@ from physics.fieldtest import (
     parse_csv,
     process_fieldtest,
 )
+from physics.accuracy import estimate_noise_floor, honest_detection_floor
 
 
 def run_preflight(data, sample_rate_hz: float = 1.0) -> dict:
@@ -74,6 +75,13 @@ def run_preflight(data, sample_rate_hz: float = 1.0) -> dict:
 
         pt = aggregate_for_inversion(res)
 
+        # Honest ppm floor measured from THIS record (random ⊕ drift ⊕ datasheet-model
+        # error). Surfaced so a quiet record can't be mistaken for a sensitive one — the
+        # detection limit is dominated by non-averageable drift + model error, not jitter.
+        ne = estimate_noise_floor(ppm - np.asarray(res["baseline"], dtype=float), det)
+        hf = honest_detection_floor(ne.random_ppm, ne.bias_ppm)
+        from_voltage = bool(parsed["columns"].get("voltage")) and parsed["columns"]["ppm"] is None
+
         facts = {
             "n_readings": int(parsed["n"]),
             "columns": parsed["columns"],
@@ -94,6 +102,13 @@ def run_preflight(data, sample_rate_hz: float = 1.0) -> dict:
             "inversion_mean_excess_ppm": float(pt.mean_excess_ppm),
             "inversion_sigma_ppm": float(pt.sigma_ppm),
             "inversion_n_window": int(pt.n_window),
+            "floor_random_ppm": hf["random_ppm"],
+            "floor_bias_ppm": hf["bias_ppm"],
+            "floor_model_ppm": hf["model_ppm"],
+            "floor_total_ppm": hf["total_floor_ppm"],
+            "lod_ppm": hf["lod_ppm"],
+            "loq_ppm": hf["loq_ppm"],
+            "ppm_provisional": from_voltage,
         }
 
         report["facts"] = facts
@@ -128,7 +143,10 @@ def format_preflight(report: dict) -> str:
     lines += [
         "",
         "  COLUMNS DETECTED",
-        f"    methane     : {cols['ppm']!r}",
+        f"    methane     : {cols['ppm']!r}"
+        + ("  (converted from voltage — see warnings)"
+           if cols.get("voltage") and cols["ppm"] is None else ""),
+        f"    voltage     : {cols.get('voltage')!r}",
         f"    time        : {cols['time']!r}"
         + ("" if f["time_present"] else "  (none — cadence assumed)"),
         f"    temperature : {cols['temperature']!r}",
@@ -152,6 +170,13 @@ def format_preflight(report: dict) -> str:
         "  INVERSION-READINESS (aggregate_for_inversion)",
         f"    mean excess : {f['inversion_mean_excess_ppm']:g} ± "
         f"{f['inversion_sigma_ppm']:g} ppm over {f['inversion_n_window']} samples",
+        "",
+        "  HONEST DETECTION FLOOR (ppm)",
+        f"    random / drift / model : {f['floor_random_ppm']:.3f} / "
+        f"{f['floor_bias_ppm']:.3f} / {f['floor_model_ppm']:.2f} ppm",
+        f"    ►  total floor : {f['floor_total_ppm']:.3f} ppm"
+        f"    LOD : {f['lod_ppm']:.2f} ppm   LOQ : {f['loq_ppm']:.2f} ppm"
+        + ("   (ppm scale PROVISIONAL — from voltage)" if f['ppm_provisional'] else ""),
     ]
 
     if report["warnings"]:
@@ -174,7 +199,22 @@ def main(argv=None) -> int:
         "--sample-rate", type=float, default=1.0, dest="sample_rate_hz",
         help="Hz to assume if the file has no time column (default 1.0)",
     )
+    parser.add_argument(
+        "--node", default=None,
+        help="path to a node cfg (e.g. calibration/nodes/node1.py) to apply first — "
+             "required if the CSV is raw voltage (no ppm column)",
+    )
     args = parser.parse_args(argv)
+
+    if args.node is not None:
+        from physics import sensor_frontend as sf
+        from misc.calibrate import load_node_cfg
+        try:
+            _name, cfg = load_node_cfg(args.node)
+            sf.apply_node(cfg)
+        except Exception as e:
+            print(f"⛔ STOP  — cannot apply node cfg {args.node!r}: {e}", file=sys.stderr)
+            return 2
 
     try:
         with open(args.csv, "rb") as fh:

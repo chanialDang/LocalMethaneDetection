@@ -62,6 +62,7 @@ Three packages — **`physics/`** (numerical core), **`ui/`** (explanation + das
 
 ```
 physics/  plume.py (Gaussian plume + Briggs σ) · sensor_sim.py (synthetic data) ·
+          sensor_frontend.py (voltage→ppm front-end: divider+power-law+T/RH; gated) ·
           processing.py (baseline/avg/T-H/detect) · feasibility.py (sweep+verdict) ·
           accuracy.py (noise/recovery/LOD/CRB/grade) · fieldtest.py (CSV→clean→
           aggregate_for_inversion) · weather.py (Open-Meteo wind+Pasquill, offline-safe) ·
@@ -77,7 +78,8 @@ tests/    one per module + fixtures/openmeteo_archive.json (plus test_fieldtest_
           test_preflight.py, test_inversion_anchors.py, test_pipeline_e2e.py, test_sigma_table.py,
           test_rehearse.py)
 root      conftest.py · samples/custer_sample.csv · Procfile (optional Railway) ·
-          requirements.txt · CLAUDE.md · docs/DEPLOYMENT.md (field runbook: bench→CSV→invert)
+          requirements.txt · CLAUDE.md · docs/DEPLOYMENT.md (field runbook: bench→CSV→invert) ·
+          docs/CALIBRATION.md (bench runbook: volts→ppm front-end constants)
 ```
 
 **Path notes:** `plume.py`/`generate_sigma_table.py` resolve the CSV next to themselves
@@ -125,6 +127,11 @@ Upwind receptors (negative downwind coordinate) get background only.
 | `BASELINE_DRIFT_PPM` | 1.00 | ppm | **ASSUMED** — slow zero wander | `sensor_sim.py` |
 | `TEMP_COEFF_PPM_PER_C` | 0.05 | ppm/°C | **ASSUMED** — MOX temp sensitivity | `sensor_sim.py` |
 | `HUMID_COEFF_PPM_PER_PCT` | 0.02 | ppm/%RH | **ASSUMED** — MOX humidity sensitivity | `sensor_sim.py` |
+| `SUPPLY_VOLTAGE_V` | None | V | **UNSET** — V_c across divider; set from circuit (gates conversion) | `sensor_frontend.py` |
+| `LOAD_RESISTANCE_OHM` | None | Ω | **UNSET** — R_L over-amplification resistor; set from circuit | `sensor_frontend.py` |
+| `R0_OHM` | None | Ω | **UNSET** — R_s in clean air; **measure on bench** | `sensor_frontend.py` |
+| `POWERLAW_A` | 1.0 | — | **DATASHEET-TYPICAL** placeholder (R_s/R₀=A·C^−m); refit w/ span gas | `sensor_frontend.py` |
+| `POWERLAW_M` | 0.35 | — | **DATASHEET-TYPICAL** — ⚠ UNVERIFIED at 2–40 ppm (curve is 500–12,500) | `sensor_frontend.py` |
 
 `DETECT_K` and `SENSOR_NOISE_PPM` live in `sensor_sim.py`, imported by `feasibility.py`
 and `explain.py`, so the detection line, processing threshold, and verdict use one number.
@@ -161,6 +168,17 @@ optimizer still owns three bounds the model does NOT auto-fix: `u ≥ 0.5 m/s`, 
 `make_weather`, `make_baseline_drift`. `effective_noise_floor(random, bias, n_avg) =
 √[(random/√n)² + bias²]` — random averages, bias doesn't.
 
+**`sensor_frontend.py`** — the missing FIRST stage: raw ADC voltage → ppm.
+`voltage_to_ppm(v_out, T, RH)` runs `R_s = R_L·(V_c−V_out)/V_out` → `R_s/R₀ = A·C^(−m)`
+(inverted to `C = (A/ratio)^(1/m)`) → multiplicative T/RH factor. Outputs **total ppm incl.
+background** (adds none of its own — that's what `parse_csv`'s ppm already means).
+`ppm_to_voltage` is the exact inverse (round-trip test + synthetic voltage). Constants live in
+one block: circuit/bench values (`SUPPLY_VOLTAGE_V`, `LOAD_RESISTANCE_OHM`, `R0_OHM`) start
+`None` and `voltage_to_ppm` **refuses** until set (`calibration_status()` gate) so it never
+fabricates a ppm; `POWERLAW_A/M` are datasheet-typical placeholders (⚠ unverified at 2–40 ppm);
+T/RH coeffs default to a no-op. Bench runbook: `docs/CALIBRATION.md`. Per-sample bad voltage
+(`v_out ≤ 0` or `≥ V_c`, non-finite) → NaN (skipped), not a crash.
+
 **`processing.py`** — clean in order: `temp_humidity_correct` (fit a·T+b·H+c on a no-plume
 window, subtract the varying part) → `subtract_baseline` (rolling low-percentile floor;
 assumes the plume is a window minority) → `moving_average` (O(n) cumsum centred mean,
@@ -180,6 +198,10 @@ only (most generous for detection).
 token-matched header spellings with `ppm` beating generic `raw`/`value`, header-less positional
 fallback, `millis()`/epoch/ISO/clock time → seconds, unit-sanity flags; never silently misreads)
 → `process_fieldtest` (same `processing.py` pipeline, raw frame: `raw ≈ baseline + excess`).
+**Voltage entry point:** a CSV with a raw `voltage`/`adc` column (`_VOLT_NAMES`) and no ppm
+column is converted via `sensor_frontend.voltage_to_ppm` INSIDE `parse_csv` — gated on
+`calibration_status()`, so an uncalibrated front-end raises (STOP) rather than emitting a
+fabricated ppm; a real `ppm` column always wins.
 `aggregate_for_inversion` → `InversionPoint(mean_excess_ppm, sigma_ppm, …)`: time-mean of the
 **unsmoothed** excess over a meander window + the σ-of-the-mean weight (NOT pre-smoothed — WLS
 averages optimally). `make_sample_readings` for pre-sensor demos. Run `misc.preflight` on a real
@@ -354,12 +376,22 @@ background) → symmetry/monotonicity → adversarial + finiteness → two imple
   mixing → may **over**-predict ppm; note the bias direction when reporting); the in-record
   bias proxy; the ~160× Q-swing until real wind pins u + class (so `weather.py` must actually
   be wired per real run, not left default).
+- **🔬 Sensor front-end BUILT — constants pending bench** (`sensor_frontend.py`, 2026-07-12).
+  The voltage→ppm stage (`R_s = R_L·(V_c−V_out)/V_out` → `R_s/R₀ = A·C^(−m)` → T/RH) now
+  exists and is gated-wired into `parse_csv`, so a raw-voltage CSV can drive the whole
+  pipeline. What remains is **measurement, not code**: `SUPPLY_VOLTAGE_V`, `LOAD_RESISTANCE_OHM`,
+  `R0_OHM` are `None` (converter refuses until set — the gate); `POWERLAW_A/M` are
+  datasheet-typical and **⚠ unverified at 2–40 ppm** (datasheet curve is 500–12,500), so every
+  ppm is provisional until refit against certified span gas. Bench runbook + indoor guidance:
+  `docs/CALIBRATION.md`. Follow-ups: fit A/m from span gas (one-constant edit); derive the
+  noise floor from ADC bits / V_ref / R_L instead of the `sensor_sim.py` assumption; emit
+  voltage columns from `misc/rehearse.py` (uses the `ppm_to_voltage` inverse).
 - **🔧 / enhance** — pressure still fixed at 1 atm in `gm3_to_ppm_methane` (temperature is
   now wired: CSV T column → `aggregate_for_inversion.mean_temperature_c` → inversion + CRB
-  `T_K`; P_Pa remains default); nonlinear T·H weather-correction term; sensor front-end model
-  (derive the noise floor from ADC bits / V_ref / R_L instead of assuming it); multi-source
-  inversion (sum of plumes); document the over-amplification method (large load resistor +
-  precision ADC — the experimental justification for the whole project).
+  `T_K`; P_Pa remains default); nonlinear T·H weather-correction term; multi-source
+  inversion (sum of plumes). The over-amplification method (large load resistor + precision
+  ADC — the experimental justification for the whole project) is now documented in
+  `docs/CALIBRATION.md`.
 
 ### Closed ledger (guard exists; proof is the named test)
 

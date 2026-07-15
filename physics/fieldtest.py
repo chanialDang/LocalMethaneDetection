@@ -87,7 +87,13 @@ _TIME_NAMES = {"time", "t", "seconds", "sec", "s", "timestamp", "elapsed",
 _TEMP_NAMES = {"temp", "temperature", "t_c", "tempc", "temp_c", "celsius", "tc"}
 _HUMID_NAMES = {"humidity", "rh", "humid", "relative_humidity", "humidity_pct",
                 "rh_pct", "humid_pct"}
-_ALL_COLUMN_NAMES = _PPM_NAMES | _TIME_NAMES | _TEMP_NAMES | _HUMID_NAMES
+# Raw sensor-voltage / ADC column spellings. A file with one of THESE but no ppm
+# column is run through the sensor_frontend voltage→ppm converter (gated on the
+# front-end being calibrated). Kept disjoint from _PPM_NAMES so 'raw'/'value'
+# (generic ppm synonyms) are never mistaken for voltage, and vice-versa.
+_VOLT_NAMES = {"v", "volt", "voltage", "vout", "v_out", "mv", "adc", "adc_raw",
+               "counts"}
+_ALL_COLUMN_NAMES = _PPM_NAMES | _TIME_NAMES | _TEMP_NAMES | _HUMID_NAMES | _VOLT_NAMES
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -374,7 +380,28 @@ def parse_csv(data) -> dict:
 
     norm = {(name or "").strip().lower(): name for name in reader.fieldnames}
     ppm_key = _pick(norm, _PPM_NAMES, preferred=_PPM_PREFERRED)
-    if ppm_key is None:
+    volt_key = _pick(norm, _VOLT_NAMES)
+
+    # Which column carries the reading, and whether it needs voltage→ppm conversion.
+    # A real ppm column always wins; a raw sensor-voltage column is used only when
+    # there is no ppm column, and only if the front-end is calibrated (else we STOP
+    # loudly rather than emit a fabricated ppm — the gate).
+    from_voltage = False
+    reading_key = ppm_key
+    if ppm_key is None and volt_key is not None:
+        from physics import sensor_frontend as _sf
+        ready, missing = _sf.calibration_status()
+        if not ready:
+            raise ValueError(
+                f"Found a sensor-voltage column ({volt_key!r}) but no calibrated "
+                "ppm column, and the voltage→ppm front-end is not calibrated yet "
+                f"(missing: {', '.join(missing)}). Set those constants in "
+                "physics/sensor_frontend.py (see docs/CALIBRATION.md), or upload a "
+                "CSV that already has a ppm column."
+            )
+        reading_key = volt_key
+        from_voltage = True
+    elif ppm_key is None:
         # No recognizable methane header. If row 1 is entirely numeric there is
         # probably NO header at all (a raw serial dump) — fall back to positional
         # columns with a loud warning. Otherwise the header truly lacks methane.
@@ -383,8 +410,10 @@ def parse_csv(data) -> dict:
             return _parse_headerless(text, delimiter, len(reader.fieldnames))
         raise ValueError(
             "No methane column found. Add a header like 'ppm' "
-            "(accepted: ppm, ch4, methane, reading, value, concentration), or "
-            "upload a header-less file whose 1st column is time and 2nd is ppm."
+            "(accepted: ppm, ch4, methane, reading, value, concentration), a raw "
+            "voltage column (v, voltage, vout, adc) once the front-end is "
+            "calibrated, or upload a header-less file whose 1st column is time "
+            "and 2nd is ppm."
         )
     time_key = _pick(norm, _TIME_NAMES)
     temp_key = _pick(norm, _TEMP_NAMES)
@@ -397,7 +426,7 @@ def parse_csv(data) -> dict:
     for row in reader:
         if row.get(None):        # DictReader collects fields beyond the header here
             n_ragged += 1
-        ppm = _num(row.get(ppm_key), decimal_comma)
+        ppm = _num(row.get(reading_key), decimal_comma)
         if ppm is None:
             n_skipped += 1
             continue                          # skip rows without a usable reading
@@ -415,6 +444,13 @@ def parse_csv(data) -> dict:
 
     ppm_arr = np.asarray(ppms, dtype=float)
     warnings: list[str] = []
+
+    if ppm_key is not None and volt_key is not None:
+        warnings.append(
+            f"Both a ppm column ({ppm_key!r}) and a raw voltage column "
+            f"({volt_key!r}) were present; the calibrated ppm column was used and "
+            "the voltage column ignored."
+        )
 
     if n_skipped:
         warnings.append(
@@ -477,6 +513,39 @@ def parse_csv(data) -> dict:
         if n_dupe:
             warnings.append(f"{n_dupe} duplicate timestamp(s) found in the time column.")
 
+    if from_voltage:
+        # The 'ppm' arrays currently hold raw voltage; convert the whole column at
+        # once (T/RH aligned and already sorted). Done AFTER sorting so the T/RH
+        # correction lines up sample-for-sample with the reading.
+        ppm_arr = np.asarray(
+            _sf.voltage_to_ppm(ppm_arr, temp_arr, humid_arr), dtype=float
+        )
+        warnings.append(
+            "Readings were a raw sensor-voltage column, converted to ppm by the "
+            "front-end (physics/sensor_frontend.py). NOTE: the power-law A/m are "
+            "DATASHEET-TYPICAL and unverified at the 2–40 ppm operating range — "
+            "treat the ppm scale as provisional until you refit against span gas."
+        )
+        finite = np.isfinite(ppm_arr)
+        n_bad_v = int((~finite).sum())
+        if n_bad_v:
+            ppm_arr = ppm_arr[finite]
+            if time_arr is not None:
+                time_arr = time_arr[finite]
+            if temp_arr is not None:
+                temp_arr = temp_arr[finite]
+            if humid_arr is not None:
+                humid_arr = humid_arr[finite]
+            warnings.append(
+                f"{n_bad_v} voltage sample(s) fell outside the valid divider range "
+                "(0 < V_out < V_c) and were dropped after conversion."
+            )
+        if ppm_arr.size == 0:
+            raise ValueError(
+                "No valid readings after voltage→ppm conversion — every sample was "
+                "outside the divider range (0 < V_out < V_c). Check V_c/wiring."
+            )
+
     return {
         "ppm": ppm_arr,
         "time": time_arr,
@@ -484,7 +553,8 @@ def parse_csv(data) -> dict:
         "humidity": humid_arr,
         "n": len(ppm_arr),
         "columns": {"ppm": ppm_key, "time": time_key,
-                    "temperature": temp_key, "humidity": humid_key},
+                    "temperature": temp_key, "humidity": humid_key,
+                    "voltage": volt_key},
         "warnings": warnings,
     }
 
